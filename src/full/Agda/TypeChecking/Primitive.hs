@@ -213,9 +213,9 @@ instance ToTerm ArgInfo where
           Hidden     -> hid
           Instance{} -> ins
       , case getRelevance i of
-          Relevant   -> rel
-          Irrelevant -> irr
-          NonStrict  -> rel
+          Relevant        {} -> rel
+          Irrelevant      {} -> irr
+          ShapeIrrelevant {} -> rel
       ]
 
 instance ToTerm Fixity' where
@@ -963,12 +963,7 @@ primitiveFunctions = localTCStateSavingWarnings <$> Map.fromListWith __IMPOSSIBL
   , Prim_glue             |-> prim_glue'
   , Prim_unglue           |-> prim_unglue'
   , PrimFaceForall        |-> primFaceForall'
-  , PrimDepIMin           |-> primDepIMin'
-  , PrimIdFace            |-> primIdFace'
-  , PrimIdPath            |-> primIdPath'
-  , PrimIdElim            |-> primIdElim'
   , PrimSubOut            |-> primSubOut'
-  , PrimConId             |-> primConId'
   , Prim_glueU            |-> prim_glueU'
   , Prim_unglueU          |-> prim_unglueU'
   , PrimLockUniv          |-> primLockUniv'

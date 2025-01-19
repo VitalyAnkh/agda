@@ -1,116 +1,98 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE GADTs #-}
-
 -- | Interface for compiler backend writers.
 module Agda.Compiler.Backend
   ( module Agda.Compiler.Backend.Base
-  , Backend, Backend', Recompile(..), IsMain(..)
+  , Recompile(..), IsMain(..)
   , Flag
   , toTreeless
   , module Agda.Syntax.Treeless
   , module Agda.TypeChecking.Monad
   , module CheckResult
-  , activeBackendMayEraseType
     -- For Agda.Main
   , backendInteraction
   , parseBackendOptions
     -- For InteractionTop
   , callBackend
-    -- Tools
-  , lookupBackend
-  , activeBackend
+  , callBackendInteractTop
+  , callBackendInteractHole
   ) where
 
-import Agda.Compiler.Backend.Base
+import Prelude hiding (null)
 
 import Control.DeepSeq
-import Control.Monad              ( (<=<) )
-import Control.Monad.Trans        ( lift )
-import Control.Monad.Trans.Maybe
-
-import qualified Data.List as List
-import Data.Maybe
 
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 
 import System.Console.GetOpt
 
-import Agda.Syntax.Treeless
-import Agda.TypeChecking.Errors (getAllWarnings)
--- Agda.TypeChecking.Monad.Base imports us, relying on the .hs-boot file to
--- resolve the circular dependency. Fine. However, ghci loads the module after
--- compilation, so it brings in all of the symbols. That causes .Base to see
--- getBenchmark (defined in Agda.TypeChecking.Monad.State) *and* the one
--- defined in Agda.Utils.Benchmark, which causes an error. So we explicitly
--- hide it here to prevent it from being seen there and causing an error.
-import Agda.TypeChecking.Monad hiding (getBenchmark)
-import Agda.TypeChecking.Reduce
-import Agda.TypeChecking.Pretty as P
+import Agda.Compiler.Backend.Base
+import Agda.Compiler.Common
+import Agda.Compiler.ToTreeless
 
 import Agda.Interaction.Options
 import Agda.Interaction.FindFile
 import Agda.Interaction.Imports as CheckResult (CheckResult(CheckResult), crInterface, crWarnings, crMode)
+
+import Agda.Syntax.Common (BackendName)
+import Agda.Syntax.Treeless
+
+import Agda.TypeChecking.Errors (getAllWarnings)
+import Agda.TypeChecking.Monad
+import Agda.TypeChecking.Reduce
+import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Warnings
 
+import Agda.Utils.CallStack (HasCallStack)
 import Agda.Utils.FileName
 import Agda.Utils.Functor
 import Agda.Utils.IndexedList
 import Agda.Utils.Lens
 import Agda.Utils.Monad
+import Agda.Utils.Null
+import Agda.Utils.Maybe
+import Agda.Syntax.Common (InteractionId)
+import Agda.Syntax.Position (Range)
 
-import Agda.Compiler.ToTreeless
-import Agda.Compiler.Common
-
-import Agda.Utils.Impossible
+import Agda.Interaction.Command (CommandM)
 
 -- Public interface -------------------------------------------------------
 
-type Backend = Backend_boot TCM
-
-type Backend' opts env menv mod def = Backend'_boot TCM opts env menv mod def
-
 -- | Call the 'compilerMain' function of the given backend.
+callBackend :: BackendName -> IsMain -> CheckResult -> TCM ()
+callBackend name iMain checkResult =
+  withKnownBackend name $ \(Backend b) ->
+    compilerMain b iMain checkResult
 
-callBackend :: String -> IsMain -> CheckResult -> TCM ()
-callBackend name iMain checkResult = lookupBackend name >>= \case
-  Just (Backend b) -> compilerMain b iMain checkResult
-  Nothing -> do
-    backends <- useTC stBackends
-    genericError $
-      "No backend called '" ++ name ++ "' " ++
-      "(installed backends: " ++
-      List.intercalate ", "
-        (List.sort $ otherBackends ++
-                     [ backendName b | Backend b <- backends ]) ++
-      ")"
+-- | Call the 'backendInteractTop' function of the given backend.
+callBackendInteractTop :: BackendName -> String -> CommandM ()
+callBackendInteractTop name cmd =
+  withKnownBackend name $ \(Backend b) ->
+    whenJust (backendInteractTop b) \bi ->
+      bi cmd
+
+-- | Call the 'backendInteractHole' function of the given backend.
+callBackendInteractHole ::
+  BackendName -> String -> InteractionId -> Range -> String -> CommandM ()
+callBackendInteractHole name cmd ii rng s =
+  withKnownBackend name $ \(Backend b) ->
+    whenJust (backendInteractHole b) \bi ->
+      bi cmd ii rng s
+
+-- | Run a monadic action given an existing backend.
+-- Throws an error if the user requested an unknown backend.
+withKnownBackend ::
+  (MonadTCError m, ReadTCState m) => BackendName -> (Backend -> m ()) -> m ()
+withKnownBackend name k = ifJustM (lookupBackend name) k $ do
+  backends <- useTC stBackends
+  let backendSet = otherBackends ++ [ backendName b | Backend b <- backends ]
+  typeError $ UnknownBackend name (Set.fromList backendSet)
 
 -- | Backends that are not included in the state, but still available
 --   to the user.
-
-otherBackends :: [String]
+otherBackends :: [BackendName]
 otherBackends = ["GHCNoMain", "QuickLaTeX"]
-
--- | Look for a backend of the given name.
-
-lookupBackend :: BackendName -> TCM (Maybe Backend)
-lookupBackend name = useTC stBackends <&> \ backends ->
-  listToMaybe [ b | b@(Backend b') <- backends, backendName b' == name ]
-
--- | Get the currently active backend (if any).
-
-activeBackend :: TCM (Maybe Backend)
-activeBackend = runMaybeT $ do
-  bname <- MaybeT $ asksTC envActiveBackendName
-  lift $ fromMaybe __IMPOSSIBLE__ <$> lookupBackend bname
-
--- | Ask the active backend whether a type may be erased.
---   See issue #3732.
-
-activeBackendMayEraseType :: QName -> TCM Bool
-activeBackendMayEraseType q = do
-  Backend b <- fromMaybe __IMPOSSIBLE__ <$> activeBackend
-  mayEraseType b q
 
 -- Internals --------------------------------------------------------------
 
@@ -157,25 +139,22 @@ backendInteraction mainFile backends setup check = do
   checkResult <- check mainFile
 
   -- reset warnings
-  stTCWarnings `setTCLens` []
+  stTCWarnings `setTCLens` empty
 
   noMain <- optCompileNoMain <$> pragmaOptions
   let isMain | noMain    = NotMain
              | otherwise = IsMain
 
-  unlessM (optAllowUnsolved <$> pragmaOptions) $ do
-    let ws = crWarnings checkResult
-        mode = crMode checkResult
-    -- Possible warnings, but only scope checking: ok.
-    -- (Compatibility with scope checking done during options validation).
-    unless (mode == ModuleScopeChecked || null ws) $
-      genericError $ "You can only compile modules without unsolved metavariables."
-
   sequence_ [ compilerMain backend isMain checkResult | Backend backend <- backends ]
 
   -- print warnings that might have accumulated during compilation
-  ws <- filter (not . isUnsolvedWarning . tcWarning) <$> getAllWarnings AllWarnings
-  unless (null ws) $ alwaysReportSDoc "warning" 1 $ P.vcat $ P.prettyTCM <$> ws
+  ws <- filter (not . isUnsolvedWarning . tcWarning) . Set.toAscList <$> getAllWarnings AllWarnings
+  unless (null ws) $ alwaysReportSDoc "warning" 1 $
+    -- Andreas, 2024-09-06 start warning list by a newline
+    -- since type checker warnings are also newline separated.
+    -- See e.g. test/Succeed/CompileBuiltinListWarning.warn.
+    -- Also separate warnings by newlines (issue #6919).
+    vcat $ concatMap (\ w -> [ "", prettyTCM w ]) ws
 
 
 compilerMain :: Backend' opts env menv mod def -> IsMain -> CheckResult -> TCM ()
@@ -184,15 +163,13 @@ compilerMain backend isMain0 checkResult = inCompilerEnv checkResult $ do
     -- BEWARE: Do not use @optOnlyScopeChecking@ here; it does not authoritatively describe the type-checking mode!
     -- InteractionTop currently may invoke type-checking with scope checking regardless of that flag.
     when (not (scopeCheckingSuffices backend) && crMode checkResult == ModuleScopeChecked) $
-      genericError $
-        "The --only-scope-checking flag cannot be combined with " ++
-        backendName backend ++ "."
+      typeError $ BackendDoesNotSupportOnlyScopeChecking $ backendName backend
 
-    let i = crInterface checkResult
+    !i <- instantiateFull $ crInterface checkResult
     -- Andreas, 2017-08-23, issue #2714
     -- If the backend is invoked from Emacs, we can only get the --no-main
     -- pragma option now, coming from the interface file.
-    isMain <- ifM (optCompileNoMain <$> pragmaOptions)
+    !isMain <- ifM (optCompileNoMain <$> pragmaOptions)
       {-then-} (return NotMain)
       {-else-} (return isMain0)
 
@@ -209,7 +186,7 @@ compilerMain backend isMain0 checkResult = inCompilerEnv checkResult $ do
     setInterface i
     postCompile backend env isMain mods
 
-compileModule :: Backend' opts env menv mod def -> env -> IsMain -> Interface -> TCM mod
+compileModule :: HasCallStack => Backend' opts env menv mod def -> env -> IsMain -> Interface -> TCM mod
 compileModule backend env isMain i = do
   mName <- curMName
   -- The interface file will only exist if performing af full type-check, vs scoping.
@@ -222,7 +199,7 @@ compileModule backend env isMain i = do
     Skip m         -> return m
     Recompile menv -> do
       defs <- map snd . sortDefs <$> curDefs
-      res  <- mapM (compileDef' backend env menv isMain <=< instantiateFull) defs
+      res  <- mapM (compileDef' backend env menv isMain) defs
       postModule backend env menv isMain (iTopLevelModuleName i) res
 
 compileDef' :: Backend' opts env menv mod def -> env -> menv -> IsMain -> Definition -> TCM def

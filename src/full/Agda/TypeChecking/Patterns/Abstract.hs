@@ -32,25 +32,17 @@ expandLitPattern
   => A.Pattern -> m A.Pattern
 expandLitPattern = \case
   A.LitP info (LitNat n)
-    | n < 0     -> negLit -- Andreas, issue #2365, negative literals not yet supported.
-    | n > 20    -> tooBig
+    | n < 0     -> typeError NegativeLiteralInPattern  -- Andreas, issue #2365, negative literals not yet supported.
+    | n > 20    -> typeError LiteralTooBig
     | otherwise -> do
-      Con z _ _ <- primZero
-      Con s _ _ <- primSuc
+      z <- getBuiltinName_ builtinZero
+      s <- getBuiltinName_ builtinSuc
       let r     = getRange info
-      let zero  = A.ConP cinfo (unambiguous $ setRange r $ conName z) []
-          suc p = A.ConP cinfo (unambiguous $ setRange r $ conName s) [defaultNamedArg p]
+      let zero  = A.ConP cinfo (unambiguous $ setRange r z) []
+          suc p = A.ConP cinfo (unambiguous $ setRange r s) [defaultNamedArg p]
           cinfo = A.ConPatInfo ConOCon info ConPatEager
       return $ foldr ($) zero $ List.genericReplicate n suc
   p -> return p
-
-  where
-    tooBig = typeError $ GenericError $
-      "Matching on natural number literals is done by expanding " ++
-      "the literal to the corresponding constructor pattern, so " ++
-      "you probably don't want to do it this way."
-    negLit = typeError $ GenericError $
-      "Negative literals are not supported in patterns"
 
 
 -- | Expand away (deeply) all pattern synonyms in a pattern.
@@ -95,7 +87,7 @@ expandPatternSynonyms' = postTraverseAPatternM $ \case
       , "- patsyn parameters: " <+> (text . show) (killRange ns)
       , "- patsyn arguments:  " <+> (text . show) (fmap (fmap void) as)
       ]
-    case A.insertImplicitPatSynArgs (A.WildP . PatRange) (getRange x) ns as of
+    case A.insertImplicitPatSynArgs (\ _h r -> A.WildP (PatRange r)) (getRange x) ns as of
       Nothing       -> typeError $ BadArgumentsToPatternSynonym x
       Just (_, _:_) -> typeError $ TooFewArgumentsToPatternSynonym x
       Just (s, [])  -> do

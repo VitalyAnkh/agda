@@ -8,10 +8,7 @@
 module Agda.TypeChecking.Conversion where
 
 import Control.Arrow (second)
-import Control.Monad
-import Control.Monad.Except
--- Control.Monad.Fail import is redundant since GHC 8.8.1
-import Control.Monad.Fail (MonadFail)
+import Control.Monad.Except ( MonadError(..) )
 
 import Data.Function (on)
 import Data.Semigroup ((<>))
@@ -54,6 +51,7 @@ import Agda.TypeChecking.Warnings (MonadWarning)
 import Agda.Interaction.Options
 
 import Agda.Utils.Functor
+import Agda.Utils.Lens
 import Agda.Utils.List1 (List1, pattern (:|))
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Monad
@@ -78,7 +76,6 @@ type MonadConversion m =
   , MonadStatistics m
   , MonadFresh ProblemId m
   , MonadFresh Int m
-  , MonadFail m
   )
 
 -- | Try whether a computation runs without errors or new constraints
@@ -148,7 +145,7 @@ equalType = compareType CmpEq
 -- | Ignore errors in irrelevant context.
 convError :: TypeError -> TCM ()
 convError err =
-  ifM ((==) Irrelevant <$> viewTC eRelevance)
+  ifM (isIrrelevant <$> viewTC eRelevance)
     (return ())
     (typeError err)
 
@@ -211,9 +208,15 @@ compareAs cmp a u v = do
                              | otherwise = (assign rid y vs u, assign dir x us v)
         (MetaV x us, _) -> unlessSubtyping $ assign dir x us v `orelse` fallback
         (_, MetaV y vs) -> unlessSubtyping $ assign rid y vs u `orelse` fallback
-        (Def f es, Def f' es') | f == f' ->
-          ifNotM (optFirstOrder <$> pragmaOptions) fallback $ {- else -} unlessSubtyping $ do
+        (Def f es, Def f' es') | f == f' -> do
           def <- getConstInfo f
+          opts <- pragmaOptions
+          let shortcut = case theDef def of
+                _ | optFirstOrder opts                       -> True
+                d@Function{}
+                  | not $ optRequireUniqueMetaSolutions opts -> d ^. funFirstOrder
+                _                                            -> False
+          if not shortcut then fallback else unlessSubtyping $ do
           -- We do not shortcut projection-likes,
           -- Andreas, 2022-03-07, issue #5809:
           -- but irrelevant projections since they are applied to their parameters.
@@ -223,7 +226,7 @@ compareAs cmp a u v = do
           cubicalProjs <- traverse getName' [builtin_unglue, builtin_unglueU]
           let
             notFirstOrder = isJust (isRelevantProjection_ def)
-                         || any (Just f ==) cubicalProjs
+                         || (Just f) `elem` cubicalProjs
           if notFirstOrder then fallback else do
           pol <- getPolarity' cmp f
           whenProfile Profile.Conversion $ tick "compare first-order shortcut"
@@ -569,12 +572,13 @@ compareAtom cmp t m n =
         dir = fromCmp cmp
         rid = flipCmp dir     -- The reverse direction.  Bad name, I know.
 
-        assign dir x es v = assignE dir x es v t $ compareAtomDir dir t
+        assign dir x es v = assignE dir x es v t $ compareAsDir dir t
 
     reportSDoc "tc.conv.atom" 30 $
       "compareAtom" <+> fsep [ prettyTCM mb <+> prettyTCM cmp
                              , prettyTCM nb
                              , prettyTCM t
+                             , prettyTCM blocker
                              ]
     reportSDoc "tc.conv.atom" 80 $
       "compareAtom" <+> fsep [ pretty mb <+> prettyTCM cmp
@@ -713,7 +717,10 @@ compareAtom cmp t m n =
                   s = tmSort $ unArg la
                   sucla = lsuc <$> la
               bA <- runNamesT [] $ do
-                [la,phi,bT,bAS] <- mapM (open . unArg) [la,phi,bT,bAS]
+                la  <- open . unArg $ la
+                phi <- open . unArg $ phi
+                bT  <- open . unArg $ bT
+                bAS <- open . unArg $ bAS
                 (pure tSubOut <#> (pure tLSuc <@> la) <#> (Sort . tmSort <$> la) <#> phi <#> (bT <@> primIZero) <@> bAS)
               compareAtom cmp (AsTermsOf $ El (tmSort . unArg $ sucla) $ apply tHComp $ [sucla, argH (Sort s), phi] ++ [argH (unArg bT), argH bA])
                               (unArg b) (unArg b')
@@ -742,13 +749,14 @@ compareAtom cmp t m n =
                 [ "t1 =" <+> prettyTCM t1
                 , "t2 =" <+> prettyTCM t2
                 ]
-              compareDom cmp dom2 dom1 b1 b2 errH errR errQ errC errF $
+              compareDom cmp dom2 dom1 b1 b2 errH errR errQ errC errP errF $
                 compareType cmp (absBody b1) (absBody b2)
             where
             errH = typeError $ UnequalHiding t1 t2
             errR = typeError $ UnequalRelevance cmp t1 t2
             errQ = typeError $ UnequalQuantity  cmp t1 t2
             errC = typeError $ UnequalCohesion cmp t1 t2
+            errP = typeError $ UnequalPolarity cmp t1 t2
             errF = typeError $ UnequalFiniteness cmp t1 t2
           _ -> __IMPOSSIBLE__
 
@@ -780,7 +788,8 @@ compareMetas cmp t x xArgs y yArgs | x == y = blockOnError (unblockOnMeta x) $ d
          -- not all relevant arguments are variables
          Nothing -> fallback
 compareMetas cmp t x xArgs y yArgs = do
-  [p1, p2] <- mapM getMetaPriority [x,y]
+  p1 <- getMetaPriority x
+  p2 <- getMetaPriority y
   let dir = fromCmp cmp
       rid = flipCmp dir     -- The reverse direction.  Bad name, I know.
       retry = patternViolation alwaysUnblock
@@ -810,22 +819,24 @@ compareDom :: (MonadConversion m , Free c)
   -> m ()     -- ^ Continuation if mismatch in 'Relevance'.
   -> m ()     -- ^ Continuation if mismatch in 'Quantity'.
   -> m ()     -- ^ Continuation if mismatch in 'Cohesion'.
+  -> m ()     -- ^ Continuation if mismatch in 'Polarity'.
   -> m ()     -- ^ Continuation if mismatch in 'annFinite'.
   -> m ()     -- ^ Continuation if comparison is successful.
   -> m ()
 compareDom cmp0
   dom1@(Dom{domInfo = i1, unDom = a1})
   dom2@(Dom{domInfo = i2, unDom = a2})
-  b1 b2 errH errR errQ errC errF cont = do
+  b1 b2 errH errR errQ errC errP errF cont = do
   if | not $ sameHiding dom1 dom2 -> errH
      | not $ (==)         (getRelevance dom1) (getRelevance dom2) -> errR
      | not $ sameQuantity (getQuantity  dom1) (getQuantity  dom2) -> errQ
      | not $ sameCohesion (getCohesion  dom1) (getCohesion  dom2) -> errC
+     | not $ samePolarity (getModalPolarity dom1) (getModalPolarity dom2) -> errP
      | not $ domIsFinite dom1 == domIsFinite dom2 -> errF
      | otherwise -> do
       let r = max (getRelevance dom1) (getRelevance dom2)
               -- take "most irrelevant"
-          dependent = (r /= Irrelevant) && isBinderUsed b2
+          dependent = not (isIrrelevant r) && isBinderUsed b2
       pid <- newProblem_ $ compareType cmp0 a1 a2
       dom <- if dependent
              then (\ a -> dom1 {unDom = a}) <$> blockTypeOnProblem a1 pid
@@ -1942,7 +1953,7 @@ equalSort s1 s2 = do
           , "  s2 =" <+> prettyTCM s2
           ]
         sizedTypesEnabled <- sizedTypesOption
-        cubicalEnabled <- isJust . optCubical <$> pragmaOptions
+        cubicalEnabled <- isJust <$> cubicalOption
         levelUnivEnabled <- optLevelUniverse <$> pragmaOptions
         let postpone = patternViolation blocker
             err :: m ()
@@ -2109,7 +2120,7 @@ forallFaceMaps t kb k = do
       let t = foldr (\ x r -> and `apply` [argN x,argN r]) io ts
       ifBlocked t blocked unblocked
     addBindings [] m = m
-    addBindings ((Dom{domInfo = info,unDom = (nm,ty)},t):bs) m = addLetBinding info Inserted nm t ty (addBindings bs m)
+    addBindings ((CtxVar nm Dom{domInfo = info,unDom = ty},t):bs) m = addLetBinding info Inserted nm t ty (addBindings bs m)
 
     substContextN :: MonadConversion m => Context -> [(Int,Term)] -> m (Context , Substitution)
     substContextN c [] = return (c, idS)

@@ -1,6 +1,6 @@
 cabal-version:   2.4
 name:            Agda
-version:         2.6.5
+version:         2.8.0
 build-type:      Custom
 license:         MIT
 license-file:    LICENSE
@@ -29,25 +29,23 @@ description:
     This package includes both a command-line program (agda) and an
     Emacs mode. If you want to use the Emacs mode you can set it up by
     running @agda-mode setup@ (see the README).
-    .
-    Note that the Agda package does not follow the package versioning
-    policy, because it is not intended to be used by third-party
-    packages.
 
 tested-with:
-    GHC == 9.8.1
-    GHC == 9.6.4
+    GHC == 9.10.1
+    GHC == 9.8.4
+    GHC == 9.6.6
     GHC == 9.4.8
     GHC == 9.2.8
     GHC == 9.0.2
     GHC == 8.10.7
     GHC == 8.8.4
-    GHC == 8.6.5
 
 extra-doc-files:
     CHANGELOG.md
     README.md
     doc/user-manual/agda.svg
+    doc/release-notes/2.7.0.md
+    doc/release-notes/2.6.4.3.md
     doc/release-notes/2.6.4.2.md
     doc/release-notes/2.6.4.1.md
     doc/release-notes/2.6.4.md
@@ -90,14 +88,14 @@ extra-doc-files:
     doc/release-notes/2.2.0.md
 
 extra-source-files:
-    stack-9.8.1.yaml
-    stack-9.6.4.yaml
+    stack-9.10.1.yaml
+    stack-9.8.4.yaml
+    stack-9.6.6.yaml
     stack-9.4.8.yaml
     stack-9.2.8.yaml
     stack-9.0.2.yaml
     stack-8.10.7.yaml
     stack-8.8.4.yaml
-    stack-8.6.5.yaml
 
 data-dir:
     src/data
@@ -106,6 +104,7 @@ data-files:
     emacs-mode/*.el
     html/Agda.css
     html/highlight-hover.js
+    JS/agda-rts.mjs
     JS/agda-rts.js
     JS/agda-rts.amd.js
     latex/agda.sty
@@ -116,7 +115,6 @@ data-files:
     lib/prim/Agda/Builtin/Char/Properties.agda
     lib/prim/Agda/Builtin/Coinduction.agda
     lib/prim/Agda/Builtin/Cubical/Path.agda
-    lib/prim/Agda/Builtin/Cubical/Id.agda
     lib/prim/Agda/Builtin/Cubical/Sub.agda
     lib/prim/Agda/Builtin/Cubical/Glue.agda
     lib/prim/Agda/Builtin/Cubical/Equiv.agda
@@ -158,7 +156,7 @@ source-repository head
 source-repository this
   type:     git
   location: https://github.com/agda/agda.git
-  tag:      v2.6.5
+  tag:      v2.8.0
 
 -- Build flags
 ---------------------------------------------------------------------------
@@ -201,11 +199,11 @@ flag optimise-heavily
 
 custom-setup
   setup-depends:
-    , base      >= 4.12.0.0 && < 4.20
-    , Cabal     >= 2.4.0.1  && < 3.11
-    , directory >= 1.3.3.0  && < 1.4
-    , filepath  >= 1.4.2.1  && < 1.5
-    , process   >= 1.6.3.0  && < 1.7
+    , base      >= 4.13.0.0 && < 4.21
+    , Cabal     >= 3.0.1.0  && < 3.13
+    , directory >= 1.3.6.0  && < 1.4
+    , filepath  >= 1.4.2.1  && < 1.6
+    , process   >= 1.6.9.0  && < 1.7
 
 -- Common stanzas
 ---------------------------------------------------------------------------
@@ -233,6 +231,7 @@ common language
       -Werror=identities
       -Werror=inaccessible-code
       -Werror=inline-rule-shadowing
+      -Werror=missed-extra-shared-lib
       -Werror=missing-fields
       -Werror=missing-home-modules
       -Werror=missing-methods
@@ -243,7 +242,6 @@ common language
       -Werror=overflowed-literals
       -Werror=overlapping-patterns
 --      -Werror=redundant-constraints
-      -Werror=semigroup
       -Werror=simplifiable-class-constraints
       -Werror=star-binder
       -Werror=star-is-type
@@ -268,9 +266,10 @@ common language
       -Wno-incomplete-patterns
       -Wno-overlapping-patterns
 
-  if impl(ghc >= 8.8)
+  if impl(ghc < 9.10)
     ghc-options:
-      -Werror=missed-extra-shared-lib
+      -Werror=semigroup
+        -- The semigroup warning is deprecated in GHC 9.10
 
   if impl(ghc >= 8.10)
     ghc-options:
@@ -301,8 +300,12 @@ common language
 
   if impl(ghc >= 9.4)
     ghc-options:
-      -Werror=forall-identifier
       -Werror=type-equality-out-of-scope
+
+  if impl(ghc >= 9.4 && < 9.10)
+    ghc-options:
+      -Werror=forall-identifier
+        -- The forall-identifier warning is deprecated in GHC 9.10
 
   default-language: Haskell2010
 
@@ -322,10 +325,12 @@ common language
       DeriveGeneric
       DeriveTraversable
       DerivingStrategies
+      DerivingVia
       ExistentialQuantification
       FlexibleContexts
       FlexibleInstances
       FunctionalDependencies
+      GADTs
       GeneralizedNewtypeDeriving
       InstanceSigs
       LambdaCase
@@ -342,11 +347,27 @@ common language
       TypeFamilies
       TypeOperators
       TypeSynonymInstances
+      ViewPatterns
 
   other-extensions:
+      AllowAmbiguousTypes
+      ApplicativeDo
       CPP
+      DataKinds
       DeriveAnyClass
+      ImplicitParams
+      KindSignatures
+      MagicHash
+      NondecreasingIndentation
+      OverloadedLists
       PartialTypeSignatures
+      PatternGuards
+      PolyKinds
+      RebindableSyntax
+      TemplateHaskell
+      TypeApplications
+      UnboxedTuples
+      UndecidableInstances
 
 
 -- Agda library
@@ -385,79 +406,71 @@ library
   if os(windows)
     build-depends:  Win32 >= 2.6.1.0 && < 2.15
 
-  -- Agda cannot be built with GHC 8.6.1 due to a compiler bug, see
-  -- Agda Issue #3344.
-  if impl(ghc == 8.6.1)
-    buildable: False
-
-  -- Agda cannot be built with Windows and GHC 8.6.3 due to a compiler
-  -- bug, see Agda Issue #3657.
-  if os(windows) && impl(ghc == 8.6.3)
-    buildable: False
-
   -- For libraries that come with GHC, we take the shipped version as default lower bound.
+  -- For the other libraries, we take the lower bound from the oldest LTS we support.
+  -- This is currently LTS 16.31 (last for GHC 8.8.4).
   build-depends:
     -- Please keep in alphabetical order!
-    , aeson                >= 1.1.2.0   && < 2.3
-    , ansi-terminal        >= 0.9       && < 1.2
-    , array                >= 0.5.2.0   && < 0.6
-    , async                >= 2.2       && < 2.3
-    , base                 >= 4.12.0.0  && < 4.20
-    , binary               >= 0.8.6.0   && < 0.9
-    , blaze-html           >= 0.8       && < 0.10
-    , boxes                >= 0.1.3     && < 0.2
-    , bytestring           >= 0.10.8.2  && < 0.13
-    , case-insensitive     >= 1.2.0.4   && < 1.3
-    , containers           >= 0.6.0.1   && < 0.8
-    , data-hash            >= 0.2.0.0   && < 0.3
+    , aeson                >= 1.4.7.1   && < 2.3
+    , ansi-terminal        >= 0.10.3    && < 1.2
+    , array                >= 0.5.4.0   && < 0.6
+    , async                >= 2.2.2     && < 2.3
+    , base                 >= 4.13.0.0  && < 4.21
+    , binary               >= 0.8.7.0   && < 0.9
+    , blaze-html           >= 0.9.1.2   && < 0.10
+    , boxes                >= 0.1.5     && < 0.2
+    , bytestring           >= 0.10.10.1 && < 0.13
+    , case-insensitive     >= 1.2.1.0   && < 1.3
+    , containers           >= 0.6.2.1   && < 0.8
+        -- containers-0.6.3.1 adds IntSet.mapMonotonic, but its too young for GHC 8.8
+    , data-hash            >= 0.2.0.1   && < 0.3
     , deepseq              >= 1.4.4.0   && < 1.6
-    , directory            >= 1.3.3.0   && < 1.4
-    , dlist                >= 0.8       && < 1.1
-    , edit-distance        >= 0.2.1.2   && < 0.3
-    , equivalence          >= 0.3.2     && < 0.5
-    -- exceptions-0.8 instead of 0.10 because of stack
-    , exceptions           >= 0.8       && < 0.11
-    , filepath             >= 1.4.2.1   && < 1.5
+    , directory            >= 1.3.6.0   && < 1.4
+    , dlist                >= 0.8.0.8   && < 1.1
+    , edit-distance        >= 0.2.2.1   && < 0.3
+    , enummapset           >= 0.6.0.3   && < 0.8
+    , equivalence          >= 0.3.5     && < 0.5
+    , exceptions           >= 0.10.4    && < 0.11
+    , filepath             >= 1.4.2.1   && < 1.6
+    , filemanip            >= 0.3.6.3   && < 0.4
+    , generic-data         >= 0.9.2.0   && < 1.2
+        -- generic-data-0.9.2.0 adds instance of Bounded for FiniteEnumeration
     , ghc-compact          == 0.1.*
     , gitrev               >= 1.3.1     && < 2
-    -- hashable 1.2.0.10 makes library-test 10x
-    -- slower. The issue was fixed in hashable 1.2.1.0.
-    -- https://github.com/tibbe/hashable/issues/57.
-    , hashable             >= 1.2.1.0   && < 1.5
-    , haskeline            >= 0.7.4.3   && < 0.9
-    -- monad-control-1.0.1.0 is the first to contain liftThrough
-    , monad-control        >= 1.0.1.0   && < 1.1
+    , hashable             >= 1.3.0.0   && < 1.6
+    , haskeline            >= 0.7.5.0   && < 0.9
+    , monad-control        >= 1.0.2.3   && < 1.1
     , mtl                  >= 2.2.2     && < 2.4
-    , murmur-hash          >= 0.1       && < 0.2
+    , murmur-hash          >= 0.1.0.9   && < 0.2
+    , nonempty-containers  >= 0.3.4.1   && < 0.4
     , parallel             >= 3.2.2.0   && < 3.3
     , peano                >= 0.1.0.1   && < 0.2
-    , pqueue               >= 1.4.1.2   && < 1.6
-    , pretty               >= 1.1.3.3   && < 1.2
-    , process              >= 1.6.3.0   && < 1.7
+    , pqueue               >= 1.4.1.3   && < 1.6
+    , pretty               >= 1.1.3.6   && < 1.2
+    , process              >= 1.6.9.0   && < 1.7
+    , process-extras       >= 0.7.4     && < 0.8
     , regex-tdfa           >= 1.3.1.0   && < 1.4
-    , split                >= 0.2.0.0   && < 0.3
-    , stm                  >= 2.4.4     && < 2.6
-    , STMonadTrans         >= 0.4.3     && < 0.5
+    , split                >= 0.2.3.4   && < 0.3
+    , stm                  >= 2.5.0.0   && < 2.6
+    , STMonadTrans         >= 0.4.5     && < 0.5
     , strict               >= 0.4.0.1   && < 0.6
-    , text                 >= 1.2.3.1   && < 2.2
-    , time                 >= 1.8.0.2   && < 1.13
-    , time-compat          >= 1.9.2     && < 1.10
-        -- time-compat adds needed functionality missing in time < 1.9
-    , transformers         >= 0.5.5.0   && < 0.7
-    , unordered-containers >= 0.2.9.0   && < 0.3
-        -- unordered-containers < 0.2.9 need base < 4.11
-    , uri-encode           >= 1.5.0.4   && < 1.6
-    , vector               >= 0.12      && < 0.14
+        -- module Data.Strict.Classes entered in strict-0.4
+    , text                 >= 1.2.4.0   && < 2.2
+    , time                 >= 1.9.3     && < 1.15
+    , transformers         >= 0.5.6.2   && < 0.7
+    , unordered-containers >= 0.2.10.0  && < 0.3
+    , uri-encode           >= 1.5.0.7   && < 1.6
+    , vector               >= 0.12.1.2  && < 0.14
     , vector-hashtables    >= 0.1.1.1   && < 0.2
-    , zlib                 >= 0.6       && < 0.8
+    , zlib                 >= 0.6.2.2   && < 0.8
 
   -- We don't write upper bounds for Alex nor Happy because the
   -- `build-tool-depends` field can not be modified in Hackage.
   build-tool-depends:
-    , alex:alex   >= 3.2.3
-        -- alex-3.2.3 is packaged with Ubuntu 18.04
-    , happy:happy >= 1.19.8
-        -- happy-1.19.8 is packaged with Ubuntu 18.04
+    , alex:alex   >= 3.2.5
+        -- alex-3.2.5 contains fixes for building with GHC 8.8
+    , happy:happy >= 1.19.12
+        -- happy-1.19.12 contains fixes for building with GHC 8.8
 
   exposed-modules:
       Agda.Benchmarking
@@ -498,6 +511,7 @@ library
       Agda.Interaction.AgdaTop
       Agda.Interaction.Base
       Agda.Interaction.BasicOps
+      Agda.Interaction.Command
       Agda.Interaction.SearchAbout
       Agda.Interaction.CommandLine
       Agda.Interaction.EmacsCommand
@@ -528,6 +542,7 @@ library
       Agda.Interaction.Library.Base
       Agda.Interaction.Library.Parse
       Agda.Interaction.Options
+      Agda.Interaction.Options.Errors
       Agda.Interaction.Options.Help
       Agda.Interaction.Options.Lenses
       Agda.Interaction.Options.Warnings
@@ -631,9 +646,12 @@ library
       Agda.TypeChecking.DeadCode
       Agda.TypeChecking.DisplayForm
       Agda.TypeChecking.DropArgs
+      Agda.TypeChecking.DiscrimTree
+      Agda.TypeChecking.DiscrimTree.Types
       Agda.TypeChecking.Empty
       Agda.TypeChecking.EtaContract
       Agda.TypeChecking.Errors
+      Agda.TypeChecking.Errors.Names
       Agda.TypeChecking.Free
       Agda.TypeChecking.Free.Lazy
       Agda.TypeChecking.Free.Precompute
@@ -656,6 +674,7 @@ library
       Agda.TypeChecking.MetaVars.Occurs
       Agda.TypeChecking.Modalities
       Agda.TypeChecking.Monad.Base
+      Agda.TypeChecking.Monad.Base.Types
       Agda.TypeChecking.Monad.Base.Warning
       Agda.TypeChecking.Monad.Benchmark
       Agda.TypeChecking.Monad.Builtin
@@ -693,7 +712,6 @@ library
       Agda.TypeChecking.Primitive
       Agda.TypeChecking.Primitive.Base
       Agda.TypeChecking.Primitive.Cubical
-      Agda.TypeChecking.Primitive.Cubical.Id
       Agda.TypeChecking.Primitive.Cubical.Glue
       Agda.TypeChecking.Primitive.Cubical.Base
       Agda.TypeChecking.Primitive.Cubical.HCompU
@@ -736,6 +754,7 @@ library
       Agda.TypeChecking.Serialise.Instances.Internal
       Agda.TypeChecking.Serialise.Instances.Errors
       Agda.TypeChecking.SizedTypes
+      Agda.TypeChecking.SizedTypes.Pretty
       Agda.TypeChecking.SizedTypes.Solve
       Agda.TypeChecking.SizedTypes.Syntax
       Agda.TypeChecking.SizedTypes.Utils
@@ -767,6 +786,7 @@ library
       Agda.Utils.Fail
       Agda.Utils.Favorites
       Agda.Utils.FileName
+      Agda.Utils.FileId
       Agda.Utils.Float
       Agda.Utils.Functor
       Agda.Utils.Function
@@ -775,6 +795,7 @@ library
       Agda.Utils.Hash
       Agda.Utils.HashTable
       Agda.Utils.Haskell.Syntax
+      Agda.Utils.IArray
       Agda.Utils.Impossible
       Agda.Utils.IndexedList
       Agda.Utils.IntSet.Infinite
@@ -791,6 +812,7 @@ library
       Agda.Utils.List2
       Agda.Utils.ListT
       Agda.Utils.Map
+      Agda.Utils.Map1
       Agda.Utils.Maybe
       Agda.Utils.Maybe.Strict
       Agda.Utils.Memo
@@ -800,12 +822,12 @@ library
       Agda.Utils.Parser.MemoisedCPS
       Agda.Utils.PartialOrd
       Agda.Utils.Permutation
-      Agda.Utils.Pointer
       Agda.Utils.POMonoid
       Agda.Utils.ProfileOptions
       Agda.Utils.RangeMap
       Agda.Utils.SemiRing
       Agda.Utils.Semigroup
+      Agda.Utils.Set1
       Agda.Utils.Singleton
       Agda.Utils.Size
       Agda.Utils.SmallSet
@@ -817,9 +839,9 @@ library
       Agda.Utils.Tuple
       Agda.Utils.TypeLevel
       Agda.Utils.TypeLits
+      Agda.Utils.Unsafe
       Agda.Utils.Update
       Agda.Utils.VarSet
-      Agda.Utils.Warshall
       Agda.Utils.WithDefault
       Agda.Utils.Zipper
       Agda.Version
@@ -830,6 +852,7 @@ library
 
   other-modules:
       Paths_Agda
+      -- Need not export submodules if parent module reexports them.
       Agda.Interaction.Highlighting.Dot.Backend
       Agda.Interaction.Highlighting.Dot.Base
       Agda.Interaction.Highlighting.HTML.Backend
@@ -838,9 +861,9 @@ library
       Agda.Interaction.Highlighting.LaTeX.Base
       Agda.Interaction.Options.Base
       Agda.Interaction.Options.HasOptions
+      Agda.Interaction.Options.Types
       Agda.Utils.CallStack.Base
       Agda.Utils.CallStack.Pretty
-      Agda.Utils.Unsafe
 
 -- Agda binary
 ---------------------------------------------------------------------------
@@ -877,10 +900,10 @@ executable agda-mode
   autogen-modules:  Paths_Agda
   other-modules:    Paths_Agda
   build-depends:
-    , base      >= 4.12.0.0 && < 4.20
-    , directory >= 1.3.3.0  && < 1.4
-    , filepath  >= 1.4.2.1  && < 1.5
-    , process   >= 1.6.3.0  && < 1.7
+    , base      >= 4.13.0.0 && < 4.21
+    , directory >= 1.3.6.0  && < 1.4
+    , filepath  >= 1.4.2.1  && < 1.6
+    , process   >= 1.6.9.0  && < 1.7
   default-language: Haskell2010
 
 -- Cabal testsuite integration has some serious bugs, but we
@@ -947,11 +970,13 @@ test-suite agda-tests
       Internal.Utils.FileName
       Internal.Utils.Graph.AdjacencyMap.Unidirectional
       Internal.Utils.IntSet
+      Internal.Utils.Lens
       Internal.Utils.List
       Internal.Utils.List1
       Internal.Utils.List2
       Internal.Utils.ListT
       Internal.Utils.Maybe.Strict
+      Internal.Utils.Monad
       Internal.Utils.Monoid
       Internal.Utils.PartialOrd
       Internal.Utils.Permutation
@@ -959,7 +984,6 @@ test-suite agda-tests
       Internal.Utils.SmallSet
       Internal.Utils.Three
       Internal.Utils.Trie
-      Internal.Utils.Warshall
       LaTeXAndHTML.Tests
       LibSucceed.Tests
       Succeed.Tests
@@ -979,24 +1003,22 @@ test-suite agda-tests
     , containers
     , directory
     , filepath
-    , filemanip        >= 0.3.6.3 && < 0.4
+    , filemanip
     , mtl
     , process
-    , process-extras   >= 0.3.0   && < 0.3.4 || >= 0.4.1.3 && < 0.5 || >= 0.7.1 && < 0.8
-    , QuickCheck       >= 2.14.1  && < 2.15
+    , process-extras
+    , QuickCheck        >= 2.14.1    && < 2.16
     , regex-tdfa
     , split
     , strict
-    , tasty            >= 1.1.0.4 && < 1.6
-    , tasty-hunit      >= 0.9.2   && < 0.11
-    , tasty-quickcheck >= 0.9.2   && < 0.11
-    -- tasty-silver 3.1.13 has option --ansi-tricks=false
-    -- NB: tasty-silver 3.2 requires tasty-1.4 at least
-    -- tasty-silver < 3.3 does not work interactively under Windows
-    , tasty-silver     >= 3.1.13  && < 3.4
-    , temporary        >= 1.2.0.3 && < 1.4
+    , tasty             >= 1.2.3     && < 1.6
+    , tasty-hunit       >= 0.10.0.3  && < 0.11
+    , tasty-quickcheck  >= 0.10.1.2  && < 0.12
+        -- NB: tasty-silver 3.2 requires tasty-1.4 at least
+    , tasty-silver      >= 3.1.15    && < 3.4
+    , temporary         >= 1.3       && < 1.4
     , text
-    , unix-compat      >= 0.4.3.1 && < 0.8
+    , unix-compat       >= 0.5.2     && < 0.8
     , unordered-containers
     , uri-encode
 

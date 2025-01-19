@@ -15,7 +15,6 @@ import GHC.Generics (Generic)
 
 import System.IO.Unsafe
 
-import Agda.Syntax.Concrete.Pretty () --instance only
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.TopLevelModuleName (TopLevelModuleName)
 import Agda.Utils.Benchmark (MonadBench(..))
@@ -51,7 +50,7 @@ data Phase
     -- ^ Writing interface files.
   | DeadCode
     -- ^ Dead code elimination.
-  | DeadCodeInstantiateFull
+  | InterfaceInstantiateFull
     -- ^ Unfolding all metas before serialization.
   | DeadCodeReachable
     -- ^ Dead code reachable definitions subphase.
@@ -97,11 +96,22 @@ data Phase
     -- ^ Subphase for 'Typing': generalizing over `variable`s
   | InstanceSearch
     -- ^ Subphase for 'Typing': solving instance goals
+  | Reflection
+    -- ^ Subphase for 'Typing': evaluating elaborator reflection
+  | InitialCandidates
+    -- ^ Subphase for 'InstanceSearch': collecting initial candidates
+  | FilterCandidates
+    -- ^ Subphase for 'InstanceSearch': checking candidates for validity
+  | OrderCandidates
+    -- ^ Subphase for 'InstanceSearch': ordering candidates for specificity
+  | CheckOverlap
+    -- ^ Subphase for 'InstanceSearch': reducing overlapping instances
   | UnifyIndices
     -- ^ Subphase for 'CheckLHS': unification of the indices
   | InverseScopeLookup
     -- ^ Pretty printing names.
   | TopModule TopLevelModuleName
+  | Typeclass QName
   | Definition QName
   deriving (Eq, Ord, Show, Generic)
 

@@ -1,7 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE ViewPatterns #-}
-
 module Agda.TypeChecking.Telescope where
 
 import Prelude hiding (null)
@@ -41,12 +39,22 @@ import qualified Agda.Utils.VarSet as VarSet
 
 import Agda.Utils.Impossible
 
--- | Flatten telescope: (Γ : Tel) -> [Type Γ]
+-- | Flatten telescope: @(Γ : Tel) -> [Type Γ]@
 flattenTel :: TermSubst a => Tele (Dom a) -> [Dom a]
 flattenTel EmptyTel          = []
 flattenTel (ExtendTel a tel) = raise (size tel + 1) a : flattenTel (absBody tel)
 
 {-# SPECIALIZE flattenTel :: Telescope -> [Dom Type] #-}
+
+-- | Turn a context into a flat telescope: all entries live in the whole context.
+-- @
+--    (Γ : Context) -> [Type Γ]
+-- @
+flattenContext :: Context -> [ContextEntry]
+flattenContext = loop 1 []
+  where
+    loop n tel []       = tel
+    loop n tel (ce:ctx) = loop (n + 1) (raise n ce : tel) ctx
 
 -- | Order a flattened telescope in the correct dependeny order: Γ ->
 --   Permutation (Γ -> Γ~)
@@ -161,6 +169,11 @@ permuteTel perm tel =
   let names = permute perm $ teleNames tel
       types = permute perm $ renameP impossible (flipP perm) $ flattenTel tel
   in  unflattenTel names types
+
+-- | Like 'permuteTel', but start with a context.
+--
+permuteContext :: Permutation -> Context -> Telescope
+permuteContext perm ctx = permuteTel perm $ contextToTel ctx
 
 -- | Recursively computes dependencies of a set of variables in a given
 --   telescope. Any dependencies outside of the telescope are ignored.
@@ -690,3 +703,18 @@ typeArity :: Type -> TCM Nat
 typeArity t = do
   TelV tel _ <- telView t
   return (size tel)
+
+-- | Fold a telescope into a monadic computation, adding variables to the
+-- context at each step.
+
+foldrTelescopeM
+  :: MonadAddContext m
+  => (Dom (ArgName, Type) -> m b -> m b)
+  -> m b
+  -> Telescope
+  -> m b
+foldrTelescopeM f b = go
+  where
+    go EmptyTel = b
+    go (ExtendTel a tel) =
+      f ((absName tel,) <$> a) $ underAbstraction a tel go

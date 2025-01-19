@@ -1,5 +1,4 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE ViewPatterns #-}
 
 -- | Function for generating highlighted and aligned LaTeX from literate
 -- Agda source.
@@ -24,7 +23,6 @@ import Data.Function (on)
 import Data.Foldable (toList)
 
 import Control.Exception.Base (IOException, try)
-import Control.Monad (forM_, mapM_, unless, when)
 import Control.Monad.Trans.Reader as R ( ReaderT(runReaderT))
 import Control.Monad.RWS.Strict
   ( RWST(runRWST)
@@ -59,7 +57,7 @@ import Paths_Agda
 import Agda.Syntax.Common
 import Agda.Syntax.Parser.Literate (literateTeX, LayerRole, atomizeLayers)
 import qualified Agda.Syntax.Parser.Literate as L
-import Agda.Syntax.Position (RangeFile, startPos)
+import Agda.Syntax.Position (RangeFile, startPos')
 import Agda.Syntax.TopLevelModuleName
   (TopLevelModuleName, moduleNameParts)
 
@@ -831,7 +829,7 @@ toLaTeX env path source hi =
               [1..]
     -- Map each character to its role
     . atomizeLayers
-    . literateTeX (startPos path)
+    . literateTeX (startPos' ())
     $ L.unpack source
   where
   infoMap = toMap hi

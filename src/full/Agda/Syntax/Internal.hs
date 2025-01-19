@@ -23,7 +23,6 @@ import GHC.Generics (Generic)
 import Agda.Syntax.Position
 import Agda.Syntax.Common
 import Agda.Syntax.Literal
-import Agda.Syntax.Concrete.Pretty (prettyHiding)
 import Agda.Syntax.Abstract.Name
 import Agda.Syntax.Internal.Blockers
 import Agda.Syntax.Internal.Elim
@@ -116,6 +115,7 @@ instance LensAnnotation    (Dom' t e) where
 instance LensRelevance (Dom' t e) where
 instance LensQuantity  (Dom' t e) where
 instance LensCohesion  (Dom' t e) where
+instance LensModalPolarity (Dom' t e) where
 
 argFromDom :: Dom' t a -> Arg a
 argFromDom Dom{domInfo = i, unDom = a} = Arg i a
@@ -419,12 +419,6 @@ data Clause = Clause
       --   pattern on the lhs.
     , clauseCatchall    :: Bool
       -- ^ Clause has been labelled as CATCHALL.
-    , clauseExact       :: Maybe Bool
-      -- ^ Pattern matching of this clause is exact, no catch-all case.
-      --   Computed by the coverage checker.
-      --   @Nothing@ means coverage checker has not run yet (clause may be inexact).
-      --   @Just False@ means clause is not exact.
-      --   @Just True@ means clause is exact.
     , clauseRecursive   :: Maybe Bool
       -- ^ @clauseBody@ contains recursive calls; computed by termination checker.
       --   @Nothing@ means that termination checker has not run yet,
@@ -1117,8 +1111,8 @@ instance Null (Tele a) where
 -- | A 'null' clause is one with no patterns and no rhs.
 --   Should not exist in practice.
 instance Null Clause where
-  empty = Clause empty empty empty empty empty empty False Nothing Nothing Nothing empty empty
-  null (Clause _ _ tel pats body _ _ _ _ _ _ wm)
+  empty = Clause empty empty empty empty empty empty False Nothing Nothing empty empty
+  null (Clause _ _ tel pats body _ _ _ _ _ wm)
     =  null tel
     && null pats
     && null body
@@ -1298,8 +1292,8 @@ instance KillRange a => KillRange (Pattern' a) where
       DefP o q ps      -> killRangeN (DefP o) q ps
 
 instance KillRange Clause where
-  killRange (Clause rl rf tel ps body t catchall exact recursive unreachable ell wm) =
-    killRangeN Clause rl rf tel ps body t catchall exact recursive unreachable ell wm
+  killRange (Clause rl rf tel ps body t catchall recursive unreachable ell wm) =
+    killRangeN Clause rl rf tel ps body t catchall recursive unreachable ell wm
 
 instance KillRange a => KillRange (Tele a) where
   killRange = fmap killRange
@@ -1341,10 +1335,10 @@ instance Pretty Term where
       Def q els            -> pretty q `pApp` els
       Con c ci vs          -> pretty (conName c) `pApp` vs
       Pi a (NoAbs _ b)     -> mparens (p > 0) $
-        sep [ prettyPrec 1 (unDom a) <+> "->"
+        sep [ pretty (getModality a) <+> prettyPrec 1 (unDom a) <+> "->"
             , nest 2 $ pretty b ]
       Pi a b               -> mparens (p > 0) $
-        sep [ pDom (domInfo a) (text (absName b) <+> ":" <+> pretty (unDom a)) <+> "->"
+        sep [ pDom (domInfo a) (pretty (getModality a) <+> text (absName b) <+> ":" <+> pretty (unDom a)) <+> "->"
             , nest 2 $ pretty (unAbs b) ]
       Sort s      -> prettyPrec p s
       Level l     -> prettyPrec p l
@@ -1360,7 +1354,7 @@ instance Pretty t => Pretty (Abs t) where
   pretty (NoAbs x t) = "NoAbs" <+> (text x <> ".") <+> pretty t
 
 instance (Pretty t, Pretty e) => Pretty (Dom' t e) where
-  pretty dom = pLock <+> pTac <+> pDom dom (pretty $ unDom dom)
+  pretty dom = pLock <+> pTac <+> pDom dom (pretty (getModality dom) <+> pretty (unDom dom))
     where
       pTac | Just t <- domTactic dom = "@" <> parens ("tactic" <+> pretty t)
            | otherwise               = empty

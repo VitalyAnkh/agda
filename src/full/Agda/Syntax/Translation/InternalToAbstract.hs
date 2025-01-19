@@ -190,12 +190,14 @@ instance Reify MetaId where
     reifyWhen = reifyWhenE
     reify x = do
       b <- asksTC envPrintMetasBare
-      mi  <- mvInfo <$> lookupLocalMeta x
+      mvar <- lookupLocalMeta x
+      let mi  = mvInfo mvar
       let mi' = Info.MetaInfo
                  { metaRange          = getRange $ miClosRange mi
                  , metaScope          = clScope $ miClosRange mi
                  , metaNumber         = if b then Nothing else Just x
                  , metaNameSuggestion = if b then "" else miNameSuggestion mi
+                 , metaKind           =  metaInstantiationToMetaKind (mvInstantiation mvar)
                  }
           underscore = return $ A.Underscore mi'
       -- If we are printing a term that will be pasted into the user
@@ -222,7 +224,7 @@ instance Reify DisplayTerm where
     DDef f es         -> elims (A.Def f) =<< reify es
     DWithApp u us es0 -> do
       (e, es) <- reify (u, us)
-      elims (if null es then e else A.WithApp noExprInfo e es) =<< reify es0
+      elims (A.WithApp noExprInfo e es) =<< reify es0
 {-# SPECIALIZE reify :: DisplayTerm -> TCM (ReifiesTo DisplayTerm) #-}
 
 {-# SPECIALIZE reifyDisplayForm :: QName -> I.Elims -> TCM A.Expr -> TCM A.Expr #-}
@@ -340,7 +342,7 @@ reifyDisplayFormP f ps wps = do
     flattenWith :: DisplayTerm -> (QName, [I.Elim' DisplayTerm], [I.Elim' DisplayTerm])
     flattenWith (DWithApp d ds1 es2) =
       let (f, es, ds0) = flattenWith d
-      in  (f, es, ds0 ++ map (I.Apply . defaultArg) ds1 ++ map (fmap DTerm) es2)
+      in  (f, es, ds0 ++ map (I.Apply . defaultArg) (List1.toList ds1) ++ map (fmap DTerm) es2)
     flattenWith (DDef f es) = (f, es, [])     -- .^ hacky, but we should only hit this when printing debug info
     flattenWith (DTerm' (I.Def f es') es) = (f, map (fmap DTerm) $ es' ++ es, [])
     flattenWith _ = __IMPOSSIBLE__
@@ -413,7 +415,7 @@ reifyDisplayFormP f ps wps = do
               -- even the pattern variables @n < len@ can be
               -- applied to some args @vs@.
               e <- if n < len
-                   then return $ A.patternToExpr $ namedArg $ indexWithDefault __IMPOSSIBLE__ ps n
+                   then return $ patternToExpr $ namedArg $ indexWithDefault __IMPOSSIBLE__ ps n
                    else reify (I.var (n - len))
               apps e =<< argsToExpr vs
             _ -> return underscore
@@ -490,9 +492,14 @@ reifyTerm expandAnonDefs0 v0 = tryReifyAsLetBinding v0 $ do
   -- turned into head symbols *if* they have display forms attached.
   hasDisplay <- liftReduce $ unKleisli hasDisplayForms
   let
-    prefixize orig name
-      | havePfp   = (orig == ProjPrefix)  || hasDisplay name
-      | otherwise = (orig /= ProjPostfix) || hasDisplay name
+    prefixize :: ProjOrigin -> QName -> Bool
+    prefixize orig name = or
+      [ if havePfp then orig == ProjPrefix else orig /= ProjPostfix
+      , isOperator name
+          -- Andreas, 2024-06-13, issue #7318:
+          -- print e.g. G .|_| as | G |
+      , hasDisplay name
+      ]
   reportSDoc "reify.term" 80 $ pure $ "reifyTerm (unSpine v) = " <+> pretty (unSpine' prefixize v)
 
   case unSpine' prefixize v of
@@ -509,18 +516,33 @@ reifyTerm expandAnonDefs0 v0 = tryReifyAsLetBinding v0 $ do
       reportSDoc "reify.def" 80 $ return $ "reifying def" <+> pretty x
       (x, es) <- reifyPathPConstAsPath x es
       reifyDisplayForm x es $ reifyDef expandAnonDefs x es
-    I.Con c ci vs -> do
-      let x = conName c
-      isR <- isGeneratedRecordConstructor x
-      if isR || ci == ConORec
-        then do
+
+    I.Con c ci es -> do
+
+      -- If the origin is a record expression, print a record expression.
+      if isRecOrigin ci then recordExpression (conOriginToRecInfo ci) Nothing else do
+        isRecordConstructor x >>= \case
+
+          -- If it is a generated constructor, print a record expression.
+          Just (r, def) | not (_recNamedCon def) -> recordExpression (recInfoBrace noRange) $ Just (r, def)
+
+          -- Otherwise, print a constructor application.
+          _ -> constructorApplication
+      where
+        x = conName c
+
+        recordExpression ri mrdef = do
+          (r, def) <- maybe (fromMaybe __IMPOSSIBLE__ <$> isRecordConstructor x) pure mrdef
           showImp <- showImplicitArguments
           let keep (a, v) = showImp || visible a
-          r <- getConstructorData x
-          xs <- fromMaybe __IMPOSSIBLE__ <$> getRecordFieldNames_ r
-          vs <- map unArg <$> reify (fromMaybe __IMPOSSIBLE__ $ allApplyElims vs)
-          return $ A.Rec noExprInfo $ map (Left . uncurry FieldAssignment . mapFst unDom) $ filter keep $ zip xs vs
-        else reifyDisplayForm x vs $ do
+          A.Rec ri
+            . map (Left . uncurry FieldAssignment . mapFst unDom)
+            . filter keep
+            . zip (recordFieldNames def)
+            . map unArg
+            <$> reify (fromMaybe __IMPOSSIBLE__ $ allApplyElims es)
+
+        constructorApplication = reifyDisplayForm x es $ do
           def <- getConstInfo x
           let Constructor {conPars = np} = theDef def
           -- if we are the the module that defines constructor x
@@ -530,10 +552,10 @@ reifyTerm expandAnonDefs0 v0 = tryReifyAsLetBinding v0 $ do
           -- extra parameters) or equal (if not) to n
           when (n > np) __IMPOSSIBLE__
           let h = A.Con (unambiguous x)
-          if null vs
+          if null es
             then return h
             else do
-              es <- reify (map (fromMaybe __IMPOSSIBLE__ . isApplyElim) vs)
+              es <- reify $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
               -- Andreas, 2012-04-20: do not reify parameter arguments of constructor
               -- if the first regular constructor argument is hidden
               -- we turn it into a named argument, in order to avoid confusion
@@ -913,7 +935,7 @@ instance Reify i => Reify (Arg i) where
 
   reify (Arg info i) = Arg info <$> (flip reifyWhen i =<< condition)
     where condition = (return (argInfoHiding info /= Hidden) `or2M` showImplicitArguments)
-              `and2M` (return (getRelevance info /= Irrelevant) `or2M` showIrrelevantArguments)
+              `and2M` (return (not $ isIrrelevant info) `or2M` showIrrelevantArguments)
   reifyWhen b i = traverse (reifyWhen b) i
 {-# SPECIALIZE reify :: Reify i => Arg i -> TCM (ReifiesTo (Arg i)) #-}
 
@@ -1020,7 +1042,6 @@ stripImplicits toKeep params ps = do
             A.RecP i fs         -> A.RecP i $ map (fmap stripPat) fs  -- TODO Andreas: is this right?
             p@A.EqualP{}        -> p -- EqualP cannot be blanked.
             A.WithP i p         -> A.WithP i $ stripPat p -- TODO #2822: right?
-            A.AnnP i a p        -> A.AnnP i a $ stripPat p
 
           varOrDot A.VarP{}      = True
           varOrDot A.WildP{}     = True
@@ -1102,7 +1123,6 @@ instance BlankVars A.Pattern where
     A.RecP i fs   -> A.RecP i $ blank bound fs
     A.EqualP{}    -> p
     A.WithP i p   -> A.WithP i (blank bound p)
-    A.AnnP i a p  -> A.AnnP i (blank bound a) (blank bound p)
 
 instance BlankVars A.Expr where
   blank bound e = case e of
@@ -1185,10 +1205,9 @@ instance Binder A.Pattern where
     A.RecP _ _          -> empty
     A.EqualP{}          -> empty
     A.WithP _ _         -> empty
-    A.AnnP{}            -> empty
 
 instance Binder a => Binder (A.Binder' a) where
-  varsBoundIn (A.Binder p n) = varsBoundIn (p, n)
+  varsBoundIn (A.Binder p _ n) = varsBoundIn (p, n)
 
 instance Binder A.LamBinding where
   varsBoundIn (A.DomainFree _ x) = varsBoundIn x
@@ -1203,6 +1222,7 @@ instance Binder BindName where
 
 instance Binder A.LetBinding where
   varsBoundIn (LetBind _ _ x _ _) = varsBoundIn x
+  varsBoundIn (LetAxiom _ _ x _)  = varsBoundIn x
   varsBoundIn (LetPatBind _ p _)  = varsBoundIn p
   varsBoundIn LetApply{}          = empty
   varsBoundIn LetOpen{}           = empty
@@ -1331,13 +1351,22 @@ tryRecPFromConP p = do
           -- If the record constructor is generated or the user wrote a record pattern,
           -- print record pattern.
           -- Otherwise, print constructor pattern.
-          if recNamedCon def && conPatOrigin ci /= ConORec then fallback else do
-            fs <- fromMaybe __IMPOSSIBLE__ <$> getRecordFieldNames_ r
+          if _recNamedCon def && conPatOrigin ci /= ConORec then fallback else do
+            let fs = recordFieldNames def
             unless (length fs == length ps) __IMPOSSIBLE__
-            return $ A.RecP patNoRange $ zipWith mkFA fs ps
+            return $ A.RecP ci $ zipWith mkFA fs ps
         where
           mkFA ax nap = FieldAssignment (unDom ax) (namedArg nap)
     _ -> __IMPOSSIBLE__
+
+isRecOrigin :: ConOrigin -> Bool
+isRecOrigin ConORec = True
+isRecOrigin ConORecWhere = True
+isRecOrigin _ = False
+
+conOriginToRecInfo :: ConOrigin -> RecInfo
+conOriginToRecInfo ConORecWhere = recInfoWhere noRange
+conOriginToRecInfo _           = recInfoBrace noRange
 
 {-# SPECIALIZE recOrCon :: QName -> ConOrigin -> [Arg Expr] -> TCM A.Expr #-}
 -- | If the record constructor is generated or the user wrote a record expression,
@@ -1350,10 +1379,10 @@ recOrCon c co es = do
     -- If the record constructor is generated or the user wrote a record expression,
     -- print record expression.
     -- Otherwise, print constructor expression.
-    if recNamedCon def && co /= ConORec then fallback else do
-      fs <- fromMaybe __IMPOSSIBLE__ <$> getRecordFieldNames_ r
+    if _recNamedCon def && not (isRecOrigin co) then fallback else do
+      let fs = recordFieldNames def
       unless (length fs == length es) __IMPOSSIBLE__
-      return $ A.Rec empty $ zipWith mkFA fs es
+      return $ A.Rec (conOriginToRecInfo co) $ zipWith mkFA fs es
   where
   fallback = apps (A.Con (unambiguous c)) es
   mkFA ax  = Left . FieldAssignment (unDom ax) . unArg
@@ -1427,19 +1456,18 @@ instance Reify (QNamed System) where
           (IOne, False) -> False
           _ -> True
     forM sys $ \ (alpha,u) -> do
-      rhs <- RHS <$> reify u <*> pure Nothing
-      ep <- fmap (A.EqualP patNoRange) . forM alpha $ \ (phi,b) -> do
-        let
-            d True = unview IOne
-            d False = unview IZero
-        reify (phi, d b)
-
       ps <- reifyPatterns $ teleNamedArgs tel
-      ps <- stripImplicits mempty [] $ ps ++ [defaultNamedArg ep]
-      let
-        lhs = SpineLHS empty f ps
-        result = A.Clause (spineToLhs lhs) [] rhs A.noWhereDecls False
-      return result
+      ps <- List1.ifNull alpha (pure ps) {-else-} \ alpha -> do
+        ep <- fmap (A.EqualP patNoRange) . forM alpha $ \ (phi,b) -> do
+          let
+              d True = unview IOne
+              d False = unview IZero
+          reify (phi, d b)
+        pure $ ps ++ [defaultNamedArg ep]
+
+      lhs <- SpineLHS empty f <$> stripImplicits mempty [] ps
+      rhs <- reify u <&> (`RHS` Nothing)
+      return $ A.Clause (spineToLhs lhs) [] rhs A.noWhereDecls False
 {-# SPECIALIZE reify :: QNamed System -> TCM (ReifiesTo (QNamed System)) #-}
 
 instance Reify I.Type where
@@ -1465,7 +1493,7 @@ instance Reify Sort where
         I.Inf u 0 -> return $ A.Def' (nameOfUniv ULarge u) A.NoSuffix
         I.Inf u n -> return $ A.Def' (nameOfUniv ULarge u) (A.Suffix n)
         I.SizeUniv  -> do
-          I.Def sizeU [] <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSizeUniv
+          sizeU <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinSizeUniv
           return $ A.Def sizeU
         I.LockUniv  -> do
           lockU <- fromMaybe __IMPOSSIBLE__ <$> getName' builtinLockUniv
@@ -1543,6 +1571,18 @@ instance Reify i => Reify (Dom i) where
     reify (Dom{domInfo = info, unDom = i}) = Arg info <$> reify i
     {-# INLINE reify #-}
 
+
+instance Reify ContextEntry where
+  type ReifiesTo ContextEntry = A.TypedBinding
+
+  reify (CtxVar x a) = do
+    Arg info (y,t) <- reify $ (x,) <$> a
+    let r = getRange x
+        name = domName a
+        xs = singleton $ Arg info $ Named name $ A.mkBinder_ y
+    tac <- TacticAttribute <$> do traverse (Ranged noRange <.> reify) $ domTactic a
+    return $ TBind r (TypedBindingInfo tac (domIsFinite a)) xs t
+
 instance Reify i => Reify (I.Elim' i)  where
   type ReifiesTo (I.Elim' i) = I.Elim' (ReifiesTo i)
 
@@ -1551,6 +1591,12 @@ instance Reify i => Reify (I.Elim' i)  where
 
 instance Reify i => Reify [i] where
   type ReifiesTo [i] = [ReifiesTo i]
+
+  reify = traverse reify
+  reifyWhen b = traverse (reifyWhen b)
+
+instance Reify i => Reify (List1 i) where
+  type ReifiesTo (List1 i) = List1 (ReifiesTo i)
 
   reify = traverse reify
   reifyWhen b = traverse (reifyWhen b)

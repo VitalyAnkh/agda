@@ -3,6 +3,7 @@
 
 module Agda.Interaction.Base where
 
+import           Control.Applicative          ( liftA3 )
 import           Control.Concurrent.STM.TChan
 import           Control.Concurrent.STM.TVar
 import           Control.Monad                ( mplus, liftM2, liftM4 )
@@ -14,12 +15,13 @@ import qualified Data.List                    as List
 import           Data.Map                     (Map)
 import qualified Data.Map                     as Map
 import           Data.Maybe                   (listToMaybe)
+import qualified Data.Text                    as T
 
-import {-# SOURCE #-} Agda.TypeChecking.Monad.Base
+import Agda.TypeChecking.Monad.Base.Types
   (HighlightingLevel, HighlightingMethod, Comparison, Polarity)
 
 import           Agda.Syntax.Abstract         (QName)
-import           Agda.Syntax.Common           (InteractionId (..), Modality)
+import           Agda.Syntax.Common           (BackendName, InteractionId (..), Modality)
 import           Agda.Syntax.Internal         (ProblemId, Blocker)
 import           Agda.Syntax.Position
 import           Agda.Syntax.Scope.Base       (ScopeInfo)
@@ -87,6 +89,8 @@ data CurrentFile = CurrentFile
       -- ^ The modification time stamp of the file when it was loaded.
   } deriving (Show)
 
+type CommandM' = StateT CommandState
+
 ------------------------------------------------------------------------
 -- Command queues
 
@@ -136,11 +140,7 @@ type Interaction = Interaction' Range
 data Interaction' range
     -- | @cmd_load m argv@ loads the module in file @m@, using
     -- @argv@ as the command-line options.
-  = Cmd_load            FilePath [String]
-
-    -- | @cmd_compile b m argv@ compiles the module in file @m@ using
-    -- the backend @b@, using @argv@ as the command-line options.
-  | Cmd_compile         CompilerBackend FilePath [String]
+  = Cmd_load FilePath [String]
 
   | Cmd_constraints
 
@@ -148,16 +148,15 @@ data Interaction' range
     -- show those instead.
   | Cmd_metas Rewrite
 
-    -- | A command that fails if there are any unsolved
+    -- | Load a file and fail if there are any unsolved
     -- meta-variables. By default no output is generated if the
     -- command is successful.
-  | Cmd_no_metas
+    -- (This command is used in Agda's installation script (Setup.hs)).
+  | Cmd_load_no_metas FilePath
 
     -- | Shows all the top-level names in the given module, along with
     -- their types. Uses the top-level scope.
-  | Cmd_show_module_contents_toplevel
-                        Rewrite
-                        String
+  | Cmd_show_module_contents_toplevel Rewrite String
 
     -- | Shows all the top-level names in scope which mention all the given
     -- identifiers in their type.
@@ -169,19 +168,37 @@ data Interaction' range
   | Cmd_solveOne Rewrite InteractionId range String
 
     -- | Solve (all goals / the goal at point) by using Mimer proof search.
-  | Cmd_autoOne            InteractionId range String
-  | Cmd_autoAll
+  | Cmd_autoOne  Rewrite   InteractionId range String
+  | Cmd_autoAll  Rewrite
 
     -- | Parse the given expression (as if it were defined at the
     -- top-level of the current module) and infer its type.
-  | Cmd_infer_toplevel  Rewrite  -- Normalise the type?
-                        String
-
+  | Cmd_infer_toplevel Rewrite -- Normalise the type?
+                       String
 
     -- | Parse and type check the given expression (as if it were defined
     -- at the top-level of the current module) and normalise it.
-  | Cmd_compute_toplevel ComputeMode
-                         String
+  | Cmd_compute_toplevel ComputeMode String
+
+    ------------------------------------------------------------------------
+    -- Backend commands
+
+    -- | @cmd_compile b m argv@ compiles the module in file @m@ using
+    -- the backend @b@, using @argv@ as the command-line options.
+  | Cmd_compile CompilerBackend FilePath [String]
+
+    -- | Custom top-level command for backends.
+  | Cmd_backend_top
+      CompilerBackend -- ^ which backend
+      String          -- ^ arbitrary user payload
+
+    -- | Custom hole-level command for backends.
+  | Cmd_backend_hole
+      InteractionId   -- ^ the hole's ID
+      range           -- ^ range of the hole
+      String          -- ^ text inside the hole
+      CompilerBackend -- ^ which backend
+      String          -- ^ arbitrary payload
 
     ------------------------------------------------------------------------
     -- Syntax highlighting
@@ -225,7 +242,7 @@ data Interaction' range
     -- Implicit arguments
 
     -- | Tells Agda whether or not to show implicit arguments.
-  | ShowImplicitArgs    Bool -- Show them?
+  | ShowImplicitArgs Bool-- Show them?
 
 
     -- | Toggle display of implicit arguments.
@@ -235,8 +252,7 @@ data Interaction' range
     -- Irrelevant arguments
 
     -- | Tells Agda whether or not to show irrelevant arguments.
-  | ShowIrrelevantArgs    Bool -- Show them?
-
+  | ShowIrrelevantArgs Bool -- Show them?
 
     -- | Toggle display of irrelevant arguments.
   | ToggleIrrelevantArgs
@@ -398,7 +414,7 @@ instance Read a => Read (Range' a) where
 instance Read a => Read (Interval' a) where
     readsPrec = parseToReadsPrec $ do
         exact "Interval"
-        liftM2 Interval readParse readParse
+        liftA3 Interval readParse readParse readParse
 
 instance Read AbsolutePath where
     readsPrec = parseToReadsPrec $ do
@@ -421,7 +437,7 @@ instance Read a => Read (Position' a) where
 ---------------------------------------------------------
 -- | Available backends.
 
-data CompilerBackend = LaTeX | QuickLaTeX | OtherBackend String
+data CompilerBackend = LaTeX | QuickLaTeX | OtherBackend BackendName
     deriving (Eq)
 
 -- TODO 2021-08-25 get rid of custom Show instance
@@ -432,7 +448,7 @@ instance Pretty CompilerBackend where
   pretty = \case
     LaTeX          -> "LaTeX"
     QuickLaTeX     -> "QuickLaTeX"
-    OtherBackend s -> text s
+    OtherBackend s -> pretty s
 
 instance Read CompilerBackend where
   readsPrec _ s = do
@@ -440,7 +456,7 @@ instance Read CompilerBackend where
     let b = case t of
               "LaTeX"      -> LaTeX
               "QuickLaTeX" -> QuickLaTeX
-              _            -> OtherBackend t
+              _            -> OtherBackend $ T.pack t
     return (b, s)
 
 -- | Ordered ascendingly by degree of normalization.

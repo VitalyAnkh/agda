@@ -32,7 +32,7 @@ import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Sort
 import Agda.TypeChecking.Telescope
 
-import Agda.Utils.Function (applyWhen)
+import Agda.Utils.Function (applyWhen, applyWhenM)
 import Agda.Utils.Functor (($>))
 import Agda.Utils.Maybe
 import Agda.Utils.Size
@@ -148,6 +148,9 @@ instance CheckInternal Term where
         unless (usableCohesion d) $
           typeError $ VariableIsOfUnusableCohesion n (getCohesion d)
 
+        unless (usablePolarity d) $
+          typeError $ VariableIsOfUnusablePolarity n (getModalPolarity d)
+
         reportSDoc "tc.check.internal" 30 $ fsep
           [ "variable" , prettyTCM (var i) , "has type" , prettyTCM (unDom d)
           , "and modality", pretty (getModality d) ]
@@ -165,10 +168,12 @@ instance CheckInternal Term where
       Con c ci vs -> do
         -- We need to fully apply the constructor to make getConType work!
         fullyApplyCon c vs t $ \ _d _dt _pars a vs' tel t -> do
-          Con c ci vs2 <- checkSpine action a (Con c ci) vs' cmp t
-          -- Strip away the extra arguments
-          return $ applySubst (strengthenS impossible (size tel))
-            $ Con c ci $ take (length vs) vs2
+          checkSpine action a (Con c ci) vs' cmp t >>= \case
+            Con c ci vs2 ->
+              -- Strip away the extra arguments
+              return $ applySubst (strengthenS impossible (size tel))
+                $ Con c ci $ take (length vs) vs2
+            _ -> __IMPOSSIBLE__
       Lit l      -> do
         lt <- litType l
         compareType cmp lt t
@@ -191,9 +196,11 @@ instance CheckInternal Term where
             -- Preserve NoAbs
             goInside = case b of
               Abs{}   -> addContext $ (absName b,) $
-                applyWhen experimental (mapRelevance irrToNonStrict) a
+                inverseApplyPolarity (withStandardLock UnusedPolarity) $
+                applyWhen experimental (mapRelevance irrelevantToShapeIrrelevant) a
               NoAbs{} -> id
-        a <- mkDom <$> checkInternal' action (unEl $ unDom a) CmpLeq (sort sa)
+        a <- applyWhenM (optPolarity <$> pragmaOptions) (applyPolarityToContext negativePolarity) $
+               mkDom <$> checkInternal' action (unEl $ unDom a) CmpLeq (sort sa)
         v' <- goInside $ Pi a . mkRng <$> checkInternal' action (unEl $ unAbs b) CmpLeq (sort sb)
         s' <- sortOf v -- Issue #6205: do not use v' since it might not be valid syntax
         compareSort cmp s' s

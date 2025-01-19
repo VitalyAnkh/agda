@@ -8,34 +8,34 @@ import Control.Monad              ( (<=<), (<$!>) )
 import Control.Monad.IO.Class     ( MonadIO(..) )
 import Control.Monad.Except       ( MonadError(..) )
 import Control.Monad.Reader       ( MonadReader(..), asks )
+import Control.Monad.State        ( runStateT )
 import Control.Monad.State.Strict ( gets, modify )
 
 import Data.Array.IArray
-import Data.Word
 import qualified Data.Foldable as Fold
 import Data.Hashable
+import Data.HashMap.Strict (HashMap)
+import qualified Data.HashMap.Strict as HMap
 import Data.Int (Int32)
-
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IntSet
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Set (Set)
-import qualified Data.IntSet as IntSet
-import Data.IntSet (IntSet)
-import qualified Data.Set as Set
 import Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Strict.Tuple (Pair(..))
 import qualified Data.Text      as T
 import qualified Data.Text.Lazy as TL
 import Data.Typeable
-import Data.HashMap.Strict (HashMap)
-import qualified Data.HashMap.Strict as HMap
-
 import Data.Void
+import Data.Word (Word32, Word64)
 
 import Agda.Syntax.Common
 import Agda.Syntax.Builtin
 import Agda.Syntax.Concrete.Name as C
+import Agda.Syntax.Concrete (RecordDirective(..))
 import qualified Agda.Syntax.Concrete as C
 import qualified Agda.Syntax.Abstract as A
 import Agda.Syntax.Position as P
@@ -44,16 +44,21 @@ import Agda.Syntax.TopLevelModuleName
 import Agda.Interaction.FindFile
 import Agda.Interaction.Library
 
+import Agda.TypeChecking.Monad.Base.Types
 import Agda.TypeChecking.Serialise.Base
 
 import Agda.Utils.BiMap (BiMap)
 import qualified Agda.Utils.BiMap as BiMap
+import Agda.Utils.FileId (getIdFile)
 import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.List2 (List2(List2))
 import qualified Agda.Utils.List2 as List2
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Null
+import Agda.Utils.SmallSet (SmallSet(..))
+import Agda.Utils.Set1 (Set1)
+import qualified Agda.Utils.Set1 as Set1
 import Agda.Utils.Trie (Trie(..))
 import Agda.Utils.WithDefault
 
@@ -77,21 +82,27 @@ instance EmbPrj Integer where
   value i = (! i) <$!> gets integerE
 
 instance EmbPrj Word64 where
-  icod_ i = icodeN' (undefined :: Int32 -> Int32 -> Int32) (int32 q) (int32 r)
+  icod_ i = icodeN' (undefined :: Word32 -> Word32 -> Word32) (word32 q) (word32 r)
     where (q, r) = quotRem i (2 ^ 32)
-          int32 :: Word64 -> Int32
-          int32 = fromIntegral
+          word32 :: Word64 -> Word32
+          word32 = fromIntegral
 
   value = vcase valu where
-    valu [a, b] = return $! n * mod (fromIntegral a) n + mod (fromIntegral b) n
+    valu [a, b] = return $! n * fromIntegral a + fromIntegral b
     valu _      = malformed
     n = 2 ^ 32
 
-instance EmbPrj Int32 where
+instance EmbPrj Word32 where
   icod_ i = return i
   value i = return i
 
+-- Andreas, Agda Hackathon 2024-10-15
+-- Are we sure we never use an Int that does not fit into 32 bits?
 instance EmbPrj Int where
+  icod_ i = return $! fromIntegral i
+  value i = return $! fromIntegral i
+
+instance EmbPrj Int32 where
   icod_ i = return $! fromIntegral i
   value i = return $! fromIntegral i
 
@@ -158,6 +169,8 @@ instance EmbPrj Bool where
   value 1 = pure True
   value _ = malformed
 
+instance EmbPrj ConstructorOrPatternSynonym
+
 instance EmbPrj FileType where
   icod_ AgdaFileType  = pure 0
   icod_ MdFileType    = pure 1
@@ -165,6 +178,7 @@ instance EmbPrj FileType where
   icod_ TexFileType   = pure 3
   icod_ OrgFileType   = pure 4
   icod_ TypstFileType = pure 5
+  icod_ TreeFileType  = pure 6
 
   value = \case
     0 -> pure AgdaFileType
@@ -173,6 +187,7 @@ instance EmbPrj FileType where
     3 -> pure TexFileType
     4 -> pure OrgFileType
     5 -> pure TypstFileType
+    6 -> pure TreeFileType
     _ -> malformed
 
 instance EmbPrj Cubical where
@@ -238,7 +253,7 @@ instance (EmbPrj k, EmbPrj v, EmbPrj (BiMap.Tag v)) =>
 
 
 -- | Encode a list of key-value pairs as a flat list.
-mapPairsIcode :: (EmbPrj k, EmbPrj v) => [(k, v)] -> S Int32
+mapPairsIcode :: (EmbPrj k, EmbPrj v) => [(k, v)] -> S Word32
 mapPairsIcode xs = icodeNode =<< convert Empty xs where
   -- As we need to call `convert' in the tail position, the resulting list is
   -- written (and read) in reverse order, with the highest pair first in the
@@ -249,7 +264,7 @@ mapPairsIcode xs = icodeNode =<< convert Empty xs where
     entry <- icode entry
     convert (Cons start (Cons entry ys)) xs
 
-mapPairsValue :: (EmbPrj k, EmbPrj v) => [Int32] -> R [(k, v)]
+mapPairsValue :: (EmbPrj k, EmbPrj v) => [Word32] -> R [(k, v)]
 mapPairsValue = convert [] where
   convert ys [] = return ys
   convert ys (start:entry:xs) = do
@@ -266,9 +281,17 @@ instance (Ord a, EmbPrj a) => EmbPrj (Set a) where
   icod_ s = icode (Set.toAscList s)
   value s = Set.fromDistinctAscList <$!> value s
 
+instance (Ord a, EmbPrj a) => EmbPrj (Set1 a) where
+  icod_ s = icode (Set1.toAscList s)
+  value s = Set1.fromDistinctAscList <$!> value s
+
 instance EmbPrj IntSet where
   icod_ s = icode (IntSet.toAscList s)
   value s = IntSet.fromDistinctAscList <$!> value s
+
+instance Typeable a => EmbPrj (SmallSet a) where
+  icod_ (SmallSet a) = icodeN' SmallSet a
+  value = valueN SmallSet
 
 instance (Ord a, EmbPrj a, EmbPrj b) => EmbPrj (Trie a b) where
   icod_ (Trie a b)= icodeN' Trie a b
@@ -280,7 +303,7 @@ instance EmbPrj a => EmbPrj (Seq a) where
   value s = Seq.fromList <$!> value s
 
 instance EmbPrj a => EmbPrj (P.Interval' a) where
-  icod_ (P.Interval p q) = icodeN' P.Interval p q
+  icod_ (P.Interval f p q) = icodeN' P.Interval f p q
 
   value = valueN P.Interval
 
@@ -293,11 +316,13 @@ instance EmbPrj RangeFile where
             <- value r
     mf      <- gets modFile
     incs    <- gets includes
-    (r, mf) <- liftIO $ findFile'' incs m mf
+    (r, mf) <- liftIO $ runStateT (findFile'' incs m) mf
     modify $ \s -> s { modFile = mf }
     case r of
       Left err -> liftIO $ E.throwIO $ E.ErrorCall $ "file not found: " ++ show err
-      Right f  -> let !sfp = srcFilePath f in return $ RangeFile sfp (Just m)
+      Right (SourceFile i)  -> do
+        let fp = getIdFile (fileDict mf) i
+        return $ RangeFile fp (Just m)
 
 -- | Ranges are always deserialised as 'noRange'.
 
@@ -416,6 +441,11 @@ instance EmbPrj MetaId where
 
   value m = uncurry MetaId <$!> value m
 
+instance EmbPrj ProblemId where
+  icod_ (ProblemId a) = icode a
+
+  value m = ProblemId <$!> value m
+
 instance EmbPrj A.QName where
   icod_ n@(A.QName a b) = icodeMemo qnameD qnameC (qnameId n) $ icodeN' A.QName a b
 
@@ -494,6 +524,7 @@ instance EmbPrj a => EmbPrj (HasEta' a) where
     valu _   = malformed
 
 instance EmbPrj PatternOrCopattern
+instance EmbPrj OverlapMode
 
 instance EmbPrj Induction where
   icod_ Inductive   = icodeN' Inductive
@@ -585,22 +616,86 @@ instance EmbPrj Cohesion where
   value 2 = return Squash
   value _ = malformed
 
+instance EmbPrj ModalPolarity where
+  icod_ UnusedPolarity = return 0
+  icod_ StrictlyPositive = return 1
+  icod_ Positive = return 2
+  icod_ Negative = return 3
+  icod_ MixedPolarity = return 4
+
+  value 0 = return UnusedPolarity
+  value 1 = return StrictlyPositive
+  value 2 = return Positive
+  value 3 = return Negative
+  value 4 = return MixedPolarity
+  value _ = malformed
+
+instance EmbPrj PolarityModality where
+  icod_ (PolarityModality p o l) = icod_ (p, o, l)
+
+  value n = do
+    (p, o, l) <- polPair
+    return $ PolarityModality p o l
+    where
+      polPair :: R (ModalPolarity, ModalPolarity, ModalPolarity)
+      polPair = value n
+
 instance EmbPrj Modality where
-  icod_ (Modality a b c) = icodeN' Modality a b c
+  icod_ (Modality a b c d) = icodeN' Modality a b c d
 
   value = vcase $ \case
-    [a, b, c] -> valuN Modality a b c
+    [a, b, c, d] -> valuN Modality a b c d
+    _ -> malformed
+
+instance EmbPrj OriginRelevant where
+  icod_ = \case
+    ORelInferred   -> return 0
+    ORelRelevant _ -> return 1
+
+  value = \case
+    0 -> return $ ORelInferred
+    1 -> return $ ORelRelevant noRange
+    _ -> malformed
+
+instance EmbPrj OriginIrrelevant where
+  icod_ = \case
+    OIrrInferred     -> return 0
+    OIrrDot _        -> return 1
+    OIrrIrr _        -> return 2
+    OIrrIrrelevant _ -> return 3
+
+  value = \case
+    0 -> return $ OIrrInferred
+    1 -> return $ OIrrDot        noRange
+    2 -> return $ OIrrIrr        noRange
+    3 -> return $ OIrrIrrelevant noRange
+    _ -> malformed
+
+instance EmbPrj OriginShapeIrrelevant where
+  icod_ = \case
+    OShIrrInferred          -> return 0
+    OShIrrDotDot _          -> return 1
+    OShIrrShIrr _           -> return 2
+    OShIrrShapeIrrelevant _ -> return 3
+
+  value = \case
+    0 -> return $ OShIrrInferred
+    1 -> return $ OShIrrDotDot          noRange
+    2 -> return $ OShIrrShIrr           noRange
+    3 -> return $ OShIrrShapeIrrelevant noRange
     _ -> malformed
 
 instance EmbPrj Relevance where
-  icod_ Relevant       = return 0
-  icod_ Irrelevant     = return 1
-  icod_ NonStrict      = return 2
+  icod_ = \case
+    Relevant   a      -> icodeN' Relevant a
+    Irrelevant a      -> icodeN 0 Irrelevant a
+    ShapeIrrelevant a -> icodeN 1 ShapeIrrelevant a
 
-  value 0 = return Relevant
-  value 1 = return Irrelevant
-  value 2 = return NonStrict
-  value _ = malformed
+  value = vcase \case
+    [a]    -> valuN Relevant a
+    [0, a] -> valuN Irrelevant a
+    [1, a] -> valuN ShapeIrrelevant a
+    _      -> malformed
 
 instance EmbPrj Annotation where
   icod_ (Annotation l) = icodeN' Annotation l
@@ -650,15 +745,17 @@ instance EmbPrj FreeVariables where
     valu _   = malformed
 
 instance EmbPrj ConOrigin where
-  icod_ ConOSystem = return 0
-  icod_ ConOCon    = return 1
-  icod_ ConORec    = return 2
-  icod_ ConOSplit  = return 3
+  icod_ ConOSystem   = return 0
+  icod_ ConOCon      = return 1
+  icod_ ConORec      = return 2
+  icod_ ConOSplit    = return 3
+  icod_ ConORecWhere = return 4
 
   value 0 = return ConOSystem
   value 1 = return ConOCon
   value 2 = return ConORec
   value 3 = return ConOSplit
+  value 4 = return ConORecWhere
   value _ = malformed
 
 instance EmbPrj ProjOrigin where
@@ -752,3 +849,34 @@ instance EmbPrj SomeBuiltin where
     valu [0, x] = valuN BuiltinName x
     valu [1, x] = valuN PrimitiveName x
     valu _      = malformed
+
+instance EmbPrj IsInstance where
+  icod_ = \case
+    InstanceDef a  -> icodeN' InstanceDef a
+    NotInstanceDef -> icodeN' NotInstanceDef
+
+  value = vcase \case
+    [a] -> valuN InstanceDef a
+    []  -> valuN NotInstanceDef
+    _ -> malformed
+
+instance EmbPrj a => EmbPrj (RecordDirectives' a) where
+  icod_ (RecordDirectives a b c d) = icodeN' RecordDirectives a b c d
+
+  value = vcase \case
+    [a, b, c, d] -> valuN RecordDirectives a b c d
+    _ -> malformed
+
+instance EmbPrj RecordDirective where
+  icod_ = \case
+    Constructor a b      -> icodeN 0 Constructor a b
+    Eta a                -> icodeN 1 Eta a
+    Induction a          -> icodeN 2 Induction a
+    PatternOrCopattern a -> icodeN 3 PatternOrCopattern a
+
+  value = vcase \case
+    [0, a, b] -> valuN Constructor a b
+    [1, a]    -> valuN Eta a
+    [2, a]    -> valuN Induction a
+    [3, a]    -> valuN PatternOrCopattern a
+    _ -> malformed

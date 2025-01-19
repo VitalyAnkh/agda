@@ -1,13 +1,14 @@
 {-# LANGUAGE CPP       #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PartialTypeSignatures #-}
-{-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 
+{-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 module Agda.Interaction.Options.Base
     ( CommandLineOptions(..)
     , PragmaOptions(..)
+    , OptionError
     , OptionWarning(..), optionWarningName
     , Flag, OptM, runOptM, OptDescr(..), ArgDescr(..)
     , Verbosity, VerboseKey, VerboseLevel
@@ -31,6 +32,8 @@ module Agda.Interaction.Options.Base
     , InfectiveCoinfective(..)
     , InfectiveCoinfectiveOption(..)
     , infectiveCoinfectiveOptions
+    , ImpliedPragmaOption(..)
+    , impliedPragmaOptions
     , safeFlag
     , mapFlag
     , usage
@@ -77,11 +80,12 @@ module Agda.Interaction.Options.Base
     , lensOptCubical
     , lensOptGuarded
     , lensOptFirstOrder
+    , lensOptRequireUniqueMetaSolutions
     , lensOptPostfixProjections
     , lensOptKeepPatternVariables
     , lensOptInferAbsurdClauses
     , lensOptInstanceSearchDepth
-    , lensOptOverlappingInstances
+    , lensOptBacktrackingInstances
     , lensOptQualifiedInstances
     , lensOptInversionMaxDepth
     , lensOptSafe
@@ -98,6 +102,7 @@ module Agda.Interaction.Options.Base
     , lensOptConfluenceCheck
     , lensOptCohesion
     , lensOptFlatSplit
+    , lensOptPolarity
     , lensOptImportSorts
     , lensOptLoadPrimitives
     , lensOptAllowExec
@@ -138,10 +143,11 @@ module Agda.Interaction.Options.Base
     , optRewriting
     , optGuarded
     , optFirstOrder
+    , optRequireUniqueMetaSolutions
     , optPostfixProjections
     , optKeepPatternVariables
     , optInferAbsurdClauses
-    , optOverlappingInstances
+    , optBacktrackingInstances
     , optQualifiedInstances
     , optSafe
     , optDoubleCheck
@@ -154,6 +160,7 @@ module Agda.Interaction.Options.Base
     , optCallByName
     , optCohesion
     , optFlatSplit
+    , optPolarity
     , optImportSorts
     , optLoadPrimitives
     , optAllowExec
@@ -189,6 +196,7 @@ import Data.Map                 ( Map )
 import qualified Data.Map as Map
 import Data.Set                 ( Set )
 import qualified Data.Set as Set
+import qualified Data.Text as T
 
 import GHC.Generics (Generic)
 
@@ -202,14 +210,16 @@ import Text.Read                ( readMaybe )
 
 import Agda.Termination.CutOff  ( CutOff(..), defaultCutOff )
 
-import Agda.Interaction.Library ( ExeName, LibName, OptionsPragma(..) )
+import Agda.Interaction.Library ( ExeName, LibName, OptionsPragma(..), parseLibName )
 import Agda.Interaction.Options.Help
   ( Help(HelpFor, GeneralHelp)
   , string2HelpTopic
   , allHelpTopics
   , helpTopicUsage
   )
+import Agda.Interaction.Options.Types
 import Agda.Interaction.Options.Warnings
+
 import Agda.Syntax.Concrete.Glyph ( unsafeSetUnicodeOrAscii, UnicodeOrAscii(..) )
 import Agda.Syntax.Common (Cubical(..))
 import Agda.Syntax.Common.Pretty
@@ -228,6 +238,7 @@ import Agda.Utils.Monad         ( tell1 )
 import Agda.Utils.Null
 import Agda.Utils.ProfileOptions
 import Agda.Utils.String        ( unwords1 )
+import qualified Agda.Utils.String       as String
 import Agda.Utils.Trie          ( Trie )
 import qualified Agda.Utils.Trie as Trie
 import Agda.Utils.TypeLits
@@ -237,221 +248,34 @@ import Agda.Utils.Impossible
 
 import Agda.Version
 
--- OptDescr is a Functor --------------------------------------------------
-
-type VerboseKey     = String
-type VerboseKeyItem = String1
-type VerboseLevel   = Int
--- | 'Strict.Nothing' is used if no verbosity options have been given,
--- thus making it possible to handle the default case relatively
--- quickly. Note that 'Strict.Nothing' corresponds to a trie with
--- verbosity level 1 for the empty path.
-type Verbosity = Strict.Maybe (Trie VerboseKeyItem VerboseLevel)
-
 parseVerboseKey :: VerboseKey -> [VerboseKeyItem]
 parseVerboseKey = List1.wordsBy (`elem` ['.', ':'])
 
-data DiagnosticsColours
-  = AlwaysColour
-  | NeverColour
-  | AutoColour
-  deriving (Show, Generic)
+data ImpliedPragmaOption where
+  ImpliesPragmaOption
+    :: String -> Bool -> (PragmaOptions -> WithDefault a)
+    -> String -> Bool -> (PragmaOptions -> WithDefault b)
+    -> ImpliedPragmaOption
+    -- ^ The first option having the given value implies the second option having its given value.
+    --   For instance, `ImpliesPragmaOption "lossy-unification" True _optFirstOrder
+    --                                      "require-unique-meta-solutions" False _optRequireUniqueMetaSolutions`
+    --   encodes the fact that --lossy-unification implies --no-require-unique-meta-solutions.
 
-instance NFData DiagnosticsColours
-
--- Don't forget to update
---   doc/user-manual/tools/command-line-options.rst
--- if you make changes to the command-line options!
-
-data CommandLineOptions = Options
-  { optProgramName           :: String
-  , optInputFile             :: Maybe FilePath
-  , optIncludePaths          :: [FilePath]
-  , optAbsoluteIncludePaths  :: [AbsolutePath]
-      -- ^ The list should not contain duplicates.
-  , optLibraries             :: [LibName]
-  , optOverrideLibrariesFile :: Maybe FilePath
-      -- ^ Use this (if 'Just') instead of @~\/.agda\/libraries@.
-  , optDefaultLibs           :: Bool
-       -- ^ Use @~\/.agda\/defaults@.
-  , optUseLibs               :: Bool
-       -- ^ look for @.agda-lib@ files.
-  , optTraceImports          :: Integer
-       -- ^ Configure notifications about imported modules.
-  , optTrustedExecutables    :: Map ExeName FilePath
-       -- ^ Map names of trusted executables to absolute paths.
-  , optPrintAgdaDataDir      :: Bool
-  , optPrintAgdaAppDir       :: Bool
-  , optPrintVersion          :: Maybe PrintAgdaVersion
-  , optPrintHelp             :: Maybe Help
-  , optInteractive           :: Bool
-      -- ^ Agda REPL (@-I@).
-  , optGHCiInteraction       :: Bool
-  , optJSONInteraction       :: Bool
-  , optExitOnError           :: !Bool
-      -- ^ Exit if an interactive command fails.
-  , optCompileDir            :: Maybe FilePath
-      -- ^ In the absence of a path the project root is used.
-  , optGenerateVimFile       :: Bool
-  , optIgnoreInterfaces      :: Bool
-  , optIgnoreAllInterfaces   :: Bool
-  , optLocalInterfaces       :: Bool
-  , optPragmaOptions         :: PragmaOptions
-  , optOnlyScopeChecking     :: Bool
-      -- ^ Should the top-level module only be scope-checked, and not type-checked?
-  , optTransliterate         :: Bool
-      -- ^ Should code points that are not supported by the locale be transliterated?
-  , optDiagnosticsColour     :: DiagnosticsColours
-      -- ^ Configure colour output.
-  }
-  deriving (Show, Generic)
-
-instance NFData CommandLineOptions
-
--- | Options which can be set in a pragma.
-
-data PragmaOptions = PragmaOptions
-  { _optShowImplicit              :: WithDefault 'False
-  , _optShowGeneralized           :: WithDefault 'True
-      -- ^ Show generalized parameters in Pi types
-  , _optShowIrrelevant            :: WithDefault 'False
-  , _optUseUnicode                :: WithDefault' UnicodeOrAscii 'True -- Would like to write UnicodeOk instead of True here
-  , _optVerbose                   :: !Verbosity
-  , _optProfiling                 :: ProfileOptions
-  , _optProp                      :: WithDefault 'False
-  , _optLevelUniverse             :: WithDefault 'False
-  , _optTwoLevel                  :: WithDefault 'False
-  , _optAllowUnsolved             :: WithDefault 'False
-  , _optAllowIncompleteMatch      :: WithDefault 'False
-  , _optPositivityCheck           :: WithDefault 'True
-  , _optTerminationCheck          :: WithDefault 'True
-  , _optTerminationDepth          :: CutOff
-      -- ^ Cut off structural order comparison at some depth in termination checker?
-  , _optUniverseCheck             :: WithDefault 'True
-  , _optOmegaInOmega              :: WithDefault 'False
-  , _optCumulativity              :: WithDefault 'False
-  , _optSizedTypes                :: WithDefault 'False
-  , _optGuardedness               :: WithDefault 'False
-  , _optInjectiveTypeConstructors :: WithDefault 'False
-  , _optUniversePolymorphism      :: WithDefault 'True
-  , _optIrrelevantProjections     :: WithDefault 'False
-      -- off by default in > 2.5.4, see issue #2170
-  , _optExperimentalIrrelevance   :: WithDefault 'False
-      -- ^ irrelevant levels, irrelevant data matching
-  , _optWithoutK                  :: WithDefault 'False
-  , _optCubicalCompatible         :: WithDefault 'False
-  , _optCopatterns                :: WithDefault 'True
-      -- ^ Allow definitions by copattern matching?
-  , _optPatternMatching           :: WithDefault 'True
-      -- ^ Is pattern matching allowed in the current file?
-  , _optExactSplit                :: WithDefault 'False
-  , _optHiddenArgumentPuns        :: WithDefault 'False
-      -- ^ Should patterns of the form @{x}@ or @⦃ x ⦄@ be interpreted as puns?
-  , _optEta                       :: WithDefault 'True
-  , _optForcing                   :: WithDefault 'True
-      -- ^ Perform the forcing analysis on data constructors?
-  , _optProjectionLike            :: WithDefault 'True
-      -- ^ Perform the projection-likeness analysis on functions?
-  , _optErasure                   :: WithDefault 'False
-  , _optErasedMatches             :: WithDefault 'True
-      -- ^ Allow matching in erased positions for single-constructor,
-      -- non-indexed data/record types. (This kind of matching is always
-      -- allowed for record types with η-equality.)
-  , _optEraseRecordParameters     :: WithDefault 'False
-      -- ^ Mark parameters of record modules as erased?
-  , _optRewriting                 :: WithDefault 'False
-      -- ^ Can rewrite rules be added and used?
-  , _optCubical                   :: Maybe Cubical
-  , _optGuarded                   :: WithDefault 'False
-  , _optFirstOrder                :: WithDefault 'False
-      -- ^ Should we speculatively unify function applications as if they were injective?
-  , _optPostfixProjections        :: WithDefault 'False
-      -- ^ Should system generated projections 'ProjSystem' be printed
-      --   postfix (True) or prefix (False).
-  , _optKeepPatternVariables      :: WithDefault 'False
-      -- ^ Should case splitting replace variables with dot patterns
-      --   (False) or keep them as variables (True).
-  , _optInferAbsurdClauses        :: WithDefault 'True
-      -- ^ Should case splitting and coverage checking try to discharge absurd clauses?
-      --   Default: 'True', but 'False' might make coverage checking considerably faster in some cases.
-  , _optInstanceSearchDepth       :: Int
-  , _optOverlappingInstances      :: WithDefault 'False
-  , _optQualifiedInstances        :: WithDefault 'True
-      -- ^ Should instance search consider instances with qualified names?
-  , _optInversionMaxDepth         :: Int
-  , _optSafe                      :: WithDefault 'False
-  , _optDoubleCheck               :: WithDefault 'False
-  , _optSyntacticEquality         :: !(Strict.Maybe Int)
-    -- ^ Should the conversion checker use the syntactic equality
-    -- shortcut? 'Nothing' means that it should. @'Just' n@, for a
-    -- non-negative number @n@, means that syntactic equality checking
-    -- gets @n@ units of fuel. If the fuel becomes zero, then
-    -- syntactic equality checking is turned off. The fuel counter is
-    -- decreased in the failure continuation of
-    -- 'Agda.TypeChecking.SyntacticEquality.checkSyntacticEquality'.
-  , _optWarningMode               :: WarningMode
-  , _optCompileMain               :: WithDefault 'True
-    -- ^ Treat the module given at the command line or via interaction as main module in compilation?
-  , _optCaching                   :: WithDefault 'True
-  , _optCountClusters             :: WithDefault 'False
-    -- ^ Count extended grapheme clusters rather than code points
-    --   when generating LaTeX.
-  , _optAutoInline                :: WithDefault 'False
-    -- ^ Automatic compile-time inlining for simple definitions
-    --   (unless marked @NOINLINE@).
-  , _optPrintPatternSynonyms      :: WithDefault 'True
-  , _optFastReduce                :: WithDefault 'True
-      -- ^ Use the Agda abstract machine ('fastReduce')?
-  , _optCallByName                :: WithDefault 'False
-      -- ^ Use call-by-name instead of call-by-need.
-  , _optConfluenceCheck           :: Maybe ConfluenceCheck
-      -- ^ Check confluence of rewrite rules?
-  , _optCohesion                  :: WithDefault 'False
-      -- ^ Are the cohesion modalities available?
-  , _optFlatSplit                 :: WithDefault 'False
-      -- ^ Can we split on a @(\@flat x : A)@ argument?
-  , _optImportSorts               :: WithDefault 'True
-      -- ^ Should every top-level module start with an implicit statement
-      --   @open import Agda.Primitive using (Set; Prop)@?
-  , _optLoadPrimitives            :: WithDefault 'True
-      -- ^ Should we load the primitive modules at all?
-      --   This is a stronger form of 'optImportSorts'.
-  , _optAllowExec                 :: WithDefault 'False
-      -- ^ Allow running external @executables@ from meta programs.
-  , _optSaveMetas                 :: WithDefault 'False
-      -- ^ Save meta-variables to interface files.
-  , _optShowIdentitySubstitutions :: WithDefault 'False
-      -- ^ Show identity substitutions when pretty-printing terms
-      --   (i.e. always show all arguments of a metavariable).
-  , _optKeepCoveringClauses       :: WithDefault 'False
-      -- ^ Do not discard clauses constructed by the coverage checker
-      --   (needed for some external backends).
-  , _optLargeIndices              :: WithDefault 'False
-      -- ^ Allow large indices, and large forced arguments in
-      -- constructors.
-  , _optForcedArgumentRecursion   :: WithDefault 'True
-      -- ^ Allow recursion on forced constructor arguments.
-  }
-  deriving (Show, Eq, Generic)
-
-instance NFData PragmaOptions
-
-data ConfluenceCheck
-  = LocalConfluenceCheck
-  | GlobalConfluenceCheck
-  deriving (Show, Eq, Generic)
-
-instance NFData ConfluenceCheck
-
--- | Options @--version@ and @--numeric-version@ (last wins).
-data PrintAgdaVersion
-  = PrintAgdaVersion
-      -- ^ Print Agda version information and exit.
-  | PrintAgdaNumericVersion
-      -- ^ Print Agda version number and exit.
-  deriving (Show, Generic)
-
-instance NFData PrintAgdaVersion
+impliedPragmaOptions :: [ImpliedPragmaOption]
+impliedPragmaOptions =
+  [ ("erase-record-parameters", _optEraseRecordParameters) ==> ("erasure",                          _optErasure)
+  , ("erased-matches",          _optErasedMatches)         ==> ("erasure",                          _optErasure)
+  , ("flat-split",              _optFlatSplit)             ==> ("cohesion",                         _optCohesion)
+  , ("no-load-primitives",      _optLoadPrimitives)        ==> ("no-import-sorts",                  _optImportSorts)
+  , ("lossy-unification",       _optFirstOrder)            ==> ("no-require-unique-meta-solutions", _optRequireUniqueMetaSolutions)
+  ]
+  where
+    yesOrNo ('n':'o':'-':s) = (False, s)
+    yesOrNo s               = (True, s)
+    (nameA, optA) ==> (nameB, optB) = ImpliesPragmaOption stemA valA optA stemB valB optB
+      where
+        (valA, stemA) = yesOrNo nameA
+        (valB, stemB) = yesOrNo nameB
 
 -- collapse defaults
 optShowImplicit              :: PragmaOptions -> Bool
@@ -489,10 +313,11 @@ optEraseRecordParameters     :: PragmaOptions -> Bool
 optRewriting                 :: PragmaOptions -> Bool
 optGuarded                   :: PragmaOptions -> Bool
 optFirstOrder                :: PragmaOptions -> Bool
+optRequireUniqueMetaSolutions :: PragmaOptions -> Bool
 optPostfixProjections        :: PragmaOptions -> Bool
 optKeepPatternVariables      :: PragmaOptions -> Bool
 optInferAbsurdClauses        :: PragmaOptions -> Bool
-optOverlappingInstances      :: PragmaOptions -> Bool
+optBacktrackingInstances     :: PragmaOptions -> Bool
 optQualifiedInstances        :: PragmaOptions -> Bool
 optSafe                      :: PragmaOptions -> Bool
 optDoubleCheck               :: PragmaOptions -> Bool
@@ -506,6 +331,7 @@ optCallByName                :: PragmaOptions -> Bool
 -- | 'optCohesion' is implied by 'optFlatSplit'.
 optCohesion                  :: PragmaOptions -> Bool
 optFlatSplit                 :: PragmaOptions -> Bool
+optPolarity                  :: PragmaOptions -> Bool
 -- | 'optImportSorts' requires 'optLoadPrimitives'.
 optImportSorts               :: PragmaOptions -> Bool
 optLoadPrimitives            :: PragmaOptions -> Bool
@@ -550,10 +376,12 @@ optEraseRecordParameters     = collapseDefault . _optEraseRecordParameters
 optRewriting                 = collapseDefault . _optRewriting
 optGuarded                   = collapseDefault . _optGuarded
 optFirstOrder                = collapseDefault . _optFirstOrder
+optRequireUniqueMetaSolutions = collapseDefault . _optRequireUniqueMetaSolutions && not . optFirstOrder
+-- --lossy-unification implies --no-require-unique-meta-solutions
 optPostfixProjections        = collapseDefault . _optPostfixProjections
 optKeepPatternVariables      = collapseDefault . _optKeepPatternVariables
 optInferAbsurdClauses        = collapseDefault . _optInferAbsurdClauses
-optOverlappingInstances      = collapseDefault . _optOverlappingInstances
+optBacktrackingInstances     = collapseDefault . _optBacktrackingInstances
 optQualifiedInstances        = collapseDefault . _optQualifiedInstances
 optSafe                      = collapseDefault . _optSafe
 optDoubleCheck               = collapseDefault . _optDoubleCheck
@@ -567,6 +395,7 @@ optCallByName                = collapseDefault . _optCallByName
 -- --flat-split implies --cohesion
 optCohesion                  = collapseDefault . _optCohesion      || optFlatSplit
 optFlatSplit                 = collapseDefault . _optFlatSplit
+optPolarity                  = collapseDefault . _optPolarity
 -- --no-load-primitives implies --no-import-sorts
 optImportSorts               = collapseDefault . _optImportSorts   && optLoadPrimitives
 optLoadPrimitives            = collapseDefault . _optLoadPrimitives
@@ -724,6 +553,9 @@ lensOptGuarded f o = f (_optGuarded o) <&> \ i -> o{ _optGuarded = i }
 lensOptFirstOrder :: Lens' PragmaOptions _
 lensOptFirstOrder f o = f (_optFirstOrder o) <&> \ i -> o{ _optFirstOrder = i }
 
+lensOptRequireUniqueMetaSolutions :: Lens' PragmaOptions _
+lensOptRequireUniqueMetaSolutions f o = f (_optRequireUniqueMetaSolutions o) <&> \ i -> o{ _optRequireUniqueMetaSolutions = i }
+
 lensOptPostfixProjections :: Lens' PragmaOptions _
 lensOptPostfixProjections f o = f (_optPostfixProjections o) <&> \ i -> o{ _optPostfixProjections = i }
 
@@ -736,8 +568,8 @@ lensOptInferAbsurdClauses f o = f (_optInferAbsurdClauses o) <&> \ i -> o{ _optI
 lensOptInstanceSearchDepth :: Lens' PragmaOptions _
 lensOptInstanceSearchDepth f o = f (_optInstanceSearchDepth o) <&> \ i -> o{ _optInstanceSearchDepth = i }
 
-lensOptOverlappingInstances :: Lens' PragmaOptions _
-lensOptOverlappingInstances f o = f (_optOverlappingInstances o) <&> \ i -> o{ _optOverlappingInstances = i }
+lensOptBacktrackingInstances :: Lens' PragmaOptions _
+lensOptBacktrackingInstances f o = f (_optBacktrackingInstances o) <&> \ i -> o{ _optBacktrackingInstances = i }
 
 lensOptQualifiedInstances :: Lens' PragmaOptions _
 lensOptQualifiedInstances f o = f (_optQualifiedInstances o) <&> \ i -> o{ _optQualifiedInstances = i }
@@ -786,6 +618,9 @@ lensOptCohesion f o = f (_optCohesion o) <&> \ i -> o{ _optCohesion = i }
 
 lensOptFlatSplit :: Lens' PragmaOptions _
 lensOptFlatSplit f o = f (_optFlatSplit o) <&> \ i -> o{ _optFlatSplit = i }
+
+lensOptPolarity :: Lens' PragmaOptions _
+lensOptPolarity f o = f (_optPolarity o) <&> \ i -> o{ _optPolarity = i}
 
 lensOptImportSorts :: Lens' PragmaOptions _
 lensOptImportSorts f o = f (_optImportSorts o) <&> \ i -> o{ _optImportSorts = i }
@@ -844,7 +679,6 @@ defaultOptions = Options
   , optGenerateVimFile       = False
   , optIgnoreInterfaces      = False
   , optIgnoreAllInterfaces   = False
-  , optLocalInterfaces       = False
   , optPragmaOptions         = defaultPragmaOptions
   , optOnlyScopeChecking     = False
   , optTransliterate         = False
@@ -892,11 +726,12 @@ defaultPragmaOptions = PragmaOptions
   , _optCubical                   = Nothing
   , _optGuarded                   = Default
   , _optFirstOrder                = Default
+  , _optRequireUniqueMetaSolutions = Default
   , _optPostfixProjections        = Default
   , _optKeepPatternVariables      = Default
   , _optInferAbsurdClauses        = Default
   , _optInstanceSearchDepth       = 500
-  , _optOverlappingInstances      = Default
+  , _optBacktrackingInstances      = Default
   , _optQualifiedInstances        = Default
   , _optInversionMaxDepth         = 50
   , _optSafe                      = Default
@@ -913,6 +748,7 @@ defaultPragmaOptions = PragmaOptions
   , _optConfluenceCheck           = Nothing
   , _optCohesion                  = Default
   , _optFlatSplit                 = Default
+  , _optPolarity                  = Default
   , _optImportSorts               = Default
   , _optLoadPrimitives            = Default
   , _optAllowExec                 = Default
@@ -944,6 +780,9 @@ type Flag opts = opts -> OptM opts
 
 data OptionWarning
   = OptionRenamed { oldOptionName :: String, newOptionName :: String }
+      -- ^ Name of option changed in a newer version of Agda.
+  | WarningProblem WarningModeError
+      -- ^ A problem with setting or unsetting a warning.
   deriving (Show, Generic)
 
 instance NFData OptionWarning
@@ -951,13 +790,15 @@ instance NFData OptionWarning
 instance Pretty OptionWarning where
   pretty = \case
     OptionRenamed old new -> hsep
-      [ "Option", name old, "is deprecated, please use", name new, "instead" ]
+      [ "Option", option old, "is deprecated, please use", option new, "instead" ]
+    WarningProblem err -> pretty (prettyWarningModeError err) <+> "See --help=warning."
     where
-    name = text . ("--" ++)
+    option = text . ("--" ++)
 
 optionWarningName :: OptionWarning -> WarningName
 optionWarningName = \case
   OptionRenamed{} -> OptionRenamed_
+  WarningProblem{} -> WarningProblem_
 
 -- | Checks that the given options are consistent.
 --   Also makes adjustments (e.g. when one option implies another).
@@ -1091,15 +932,6 @@ recheckBecausePragmaOptionsChanged used current =
     , _optKeepPatternVariables      = empty
     }
 
--- | Infective or coinfective?
-
-data InfectiveCoinfective
-  = Infective
-  | Coinfective
-    deriving (Eq, Show, Generic)
-
-instance NFData InfectiveCoinfective
-
 -- | Descriptions of infective and coinfective options.
 
 data InfectiveCoinfectiveOption = ICOption
@@ -1185,15 +1017,10 @@ infectiveCoinfectiveOptions =
   , infectiveOption optSizedTypes             "--sized-types"
   , infectiveOption optGuardedness            "--guardedness"
   , infectiveOption optFlatSplit              "--flat-split"
+  , infectiveOption optPolarity               "--polarity"
   , infectiveOption optCohesion               "--cohesion"
   , infectiveOption optErasure                "--erasure"
   , infectiveOption optErasedMatches          "--erased-matches"
-  , infectiveOption (not . optUniverseCheck)  "--type-in-type"
-  , infectiveOption optOmegaInOmega           "--omega-in-omega"
-  , infectiveOption optInjectiveTypeConstructors "--injective-type-constructors"
-  , infectiveOption optExperimentalIrrelevance "--experimental-irrelevance"
-  , infectiveOption optCumulativity           "--cumulativity"
-  , infectiveOption optAllowExec              "--allow-exec"
   ]
   where
   cubicalCompatible =
@@ -1262,9 +1089,6 @@ ignoreInterfacesFlag o = return $ o { optIgnoreInterfaces = True }
 
 ignoreAllInterfacesFlag :: Flag CommandLineOptions
 ignoreAllInterfacesFlag o = return $ o { optIgnoreAllInterfaces = True }
-
-localInterfacesFlag :: Flag CommandLineOptions
-localInterfacesFlag o = return $ o { optLocalInterfaces = True }
 
 traceImportsFlag :: Maybe String -> Flag CommandLineOptions
 traceImportsFlag arg o = do
@@ -1366,7 +1190,7 @@ includeFlag :: FilePath -> Flag CommandLineOptions
 includeFlag d o = return $ o { optIncludePaths = d : optIncludePaths o }
 
 libraryFlag :: String -> Flag CommandLineOptions
-libraryFlag s o = return $ o { optLibraries = optLibraries o ++ [s] }
+libraryFlag s o = return $ o { optLibraries = optLibraries o ++ [parseLibName s] }
 
 overrideLibrariesFileFlag :: String -> Flag CommandLineOptions
 overrideLibrariesFileFlag s o =
@@ -1411,7 +1235,7 @@ profileFlag s o =
 warningModeFlag :: String -> Flag PragmaOptions
 warningModeFlag s o = case warningModeUpdate s of
   Right upd -> return $ o { _optWarningMode = upd (_optWarningMode o) }
-  Left err  -> throwError $ prettyWarningModeError err ++ " See --help=warning."
+  Left err  -> o <$ tell1 (WarningProblem err)
 
 terminationDepthFlag :: String -> Flag PragmaOptions
 terminationDepthFlag s o =
@@ -1447,7 +1271,7 @@ standardOptions =
 
     , Option ['?']  ["help"]    (OptArg helpFlag "TOPIC") $ concat
                     [ "print help and exit; available "
-                    , singPlural allHelpTopics "TOPIC" "TOPICs"
+                    , String.pluralS allHelpTopics "TOPIC"
                     , ": "
                     , intercalate ", " $ map fst allHelpTopics
                     ]
@@ -1482,8 +1306,6 @@ standardOptions =
                     "generate Vim highlighting files"
     , Option []     ["ignore-interfaces"] (NoArg ignoreInterfacesFlag)
                     "ignore interface files (re-type check everything)"
-    , Option []     ["local-interfaces"] (NoArg localInterfacesFlag)
-                    "put new interface files next to the Agda files they correspond to"
     , Option ['i']  ["include-path"] (ReqArg includeFlag "DIR")
                     "look for imports in DIR"
     , Option ['l']  ["library"] (ReqArg libraryFlag "LIB")
@@ -1502,17 +1324,13 @@ standardOptions =
                     ("whether or not to colour diagnostics output. The default is auto.")
     ] ++ map (fmap lensPragmaOptions) pragmaOptions
 
--- | Defined locally here since module ''Agda.Interaction.Options.Lenses''
---   has cyclic dependency.
-lensPragmaOptions :: Lens' CommandLineOptions PragmaOptions
-lensPragmaOptions f st = f (optPragmaOptions st) <&> \ opts -> st { optPragmaOptions = opts }
-
 -- | Command line options of previous versions of Agda.
 --   Should not be listed in the usage info, put parsed by GetOpt for good error messaging.
 deadStandardOptions :: [OptDescr (Flag CommandLineOptions)]
 deadStandardOptions =
     [ removedOption "sharing"    msgSharing
     , removedOption "no-sharing" msgSharing
+    , removedOption "local-interfaces" "(in 2.8.0)"
     , Option []     ["ignore-all-interfaces"] (NoArg ignoreAllInterfacesFlag) -- not deprecated! Just hidden
                     "ignore all interface files (re-type check everything, including builtin files)"
       -- https://github.com/agda/agda/issues/3522#issuecomment-461010898
@@ -1662,6 +1480,9 @@ pragmaOptions = concat
   , pragmaFlag      "flat-split" lensOptFlatSplit
                     "allow splitting on `(@flat x : A)' arguments" "(implies --cohesion)"
                     Nothing
+  , pragmaFlag      "polarity" lensOptPolarity
+                    "enable the polarity modalities (@++, @mixed, etc.) and their integration in the positivity checker" ""
+                    Nothing
   , pragmaFlag      "guardedness" lensOptGuardedness
                     "enable constructor-based guarded corecursion" "(inconsistent with --sized-types)"
                     $ Just "disable constructor-based guarded corecursion"
@@ -1734,6 +1555,7 @@ pragmaOptions = concat
                     "enable @lock/@tick attributes" ""
                     $ Just "disable @lock/@tick attributes"
   , lossyUnificationOption
+  , requireUniqueMetaSolutionsOptions
   , pragmaFlag      "postfix-projections" lensOptPostfixProjections
                     "prefer postfix projection notation" ""
                     $ Just "prefer prefix projection notation"
@@ -1746,9 +1568,7 @@ pragmaOptions = concat
   , [ Option []     ["instance-search-depth"] (ReqArg instanceDepthFlag "N")
                     "set instance search depth to N (default: 500)"
     ]
-  , pragmaFlag      "overlapping-instances" lensOptOverlappingInstances
-                    "consider recursive instance arguments during pruning of instance candidates" ""
-                    Nothing
+  , backtrackingInstancesOption
   , pragmaFlag      "qualified-instances" lensOptQualifiedInstances
                     "use instances with qualified names" ""
                     Nothing
@@ -1830,6 +1650,20 @@ lossyUnificationOption =
     "even when it could lose solutions"
     Nothing
 
+requireUniqueMetaSolutionsOptions :: [OptDescr (Flag PragmaOptions)]
+requireUniqueMetaSolutionsOptions =
+  pragmaFlag "require-unique-meta-solutions" lensOptRequireUniqueMetaSolutions
+    "require unique solutions to meta variables"
+    "even when it could lose solutions"
+    Nothing
+
+backtrackingInstancesOption :: [OptDescr (Flag PragmaOptions)]
+backtrackingInstancesOption =
+  pragmaFlag "backtracking-instance-search" lensOptBacktrackingInstances
+    "allow backtracking during instance search"
+    ""
+    Nothing
+
 -- | Pragma options of previous versions of Agda.
 --   Should not be listed in the usage info, put parsed by GetOpt for good error messaging.
 deadPragmaOptions :: [OptDescr (Flag PragmaOptions)]
@@ -1850,6 +1684,9 @@ deadPragmaOptions = concat
   , map (uncurry renamedNoArgOption)
     [ ( "experimental-lossy-unification"
       , headWithDefault __IMPOSSIBLE__ lossyUnificationOption
+      )
+    , ( "overlapping-instances"
+      , headWithDefault __IMPOSSIBLE__ backtrackingInstancesOption
       )
     ]
   ]
@@ -1900,14 +1737,12 @@ getOptSimple argv opts fileArg = \ defaults ->
     (_, _, unrecognized, errs) -> throwError $ umsg ++ emsg
 
       where
-      ucap = "Unrecognized " ++ plural unrecognized "option" ++ ":"
-      ecap = plural errs "Option error" ++ ":"
+      ucap = "Unrecognized " ++ String.pluralS unrecognized "option" ++ ":"
+      ecap = String.pluralS errs "Option error" ++ ":"
       umsg = if null unrecognized then "" else unlines $
        ucap : map suggest unrecognized
       emsg = if null errs then "" else unlines $
        ecap : errs
-      plural [_] x = x
-      plural _   x = x ++ "s"
 
       -- Suggest alternatives that are at most 3 typos away
 

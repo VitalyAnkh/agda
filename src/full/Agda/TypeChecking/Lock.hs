@@ -9,8 +9,6 @@ module Agda.TypeChecking.Lock
   )
 where
 
-import Control.Monad            ( filterM, forM, forM_ )
-
 import qualified Data.IntMap as IMap
 import qualified Data.IntSet as ISet
 import qualified Data.Set as Set
@@ -72,8 +70,8 @@ checkLockedVars t ty lk lk_ty = catchConstraint (CheckLockedVars t ty lk lk_ty) 
     earlierVars = ISet.fromList [i + 1 .. size cxt - 1]
   if termVars `ISet.isSubsetOf` earlierVars then return () else do
 
-  checked <- fmap catMaybes . forM toCheck $ \ (j,dom) -> do
-    ifM (isTimeless (snd . unDom $ dom))
+  checked <- fmap catMaybes . forM toCheck $ \ (j,ce) -> do
+    ifM (isTimeless (ctxEntryType ce))
         (return $ Just j)
         (return $ Nothing)
 
@@ -101,7 +99,7 @@ getLockVar lk = do
     fv = freeVarsIgnore IgnoreInAnnotations lk
     flex = flexibleVars fv
 
-    isLock i = fmap (getLock . domInfo) (lookupBV i) <&> \case
+    isLock i = fmap (getLock . domInfo) (domOfBV i) <&> \case
       IsLock{} -> True
       IsNotLock{} -> False
 
@@ -130,18 +128,11 @@ isTimeless t = do
     Def q _ | Just q `elem` timeless -> return True
     _                                -> return False
 
-notAllowedVarsError :: Term -> [Int] -> TCM b
-notAllowedVarsError lk is = do
-        typeError . GenericDocError =<<
-         ("The following vars are not allowed in a later value applied to"
-          <+> prettyTCM lk <+> ":" <+> prettyTCM (map var $ is))
-
-checkEarlierThan :: Term -> VSet.VarSet -> TCM ()
+-- | If the first argument is a lock variable, check that all variables in the given set
+--   are either earlier than this variable or are timeless.
+--
+checkEarlierThan :: Term -> VSet.VarSet -> TCM Bool
 checkEarlierThan lk fvs = do
-  mv <- getLockVar lk
-  caseMaybe mv (return ()) $ \ i -> do
-    let problems = filter (<= i) $ VSet.toList fvs
-    forM_ problems $ \ j -> do
-      ty <- typeOfBV j
-      unlessM (isTimeless ty) $
-        notAllowedVarsError lk [j]
+  getLockVar lk >>= \case
+    Nothing -> return True
+    Just i  -> flip allM (isTimeless <=< typeOfBV) $ filter (<= i) $ VSet.toList fvs
